@@ -349,6 +349,15 @@ export class Video extends EventTarget {
 		return _(this).metadata ? $.videoSubtitleText(handleOf(this), seconds) : '';
 	}
 
+	/**
+	 * The image subtitle (Blu-ray PGS, DVD or DVB) showing at `seconds`.
+	 * Returns its id (0 = none) when it equals `knownId`; otherwise an object
+	 * with the subtitle canvas size and its RGBA rectangles.
+	 */
+	getSubtitleBitmap(seconds = this.currentTime, knownId = 0): ReturnType<typeof $.videoSubtitleBitmap> {
+		return _(this).metadata ? $.videoSubtitleBitmap(handleOf(this), seconds, knownId) : 0;
+	}
+
 	get paused(): boolean {
 		return _(this).paused;
 	}

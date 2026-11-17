@@ -89,6 +89,21 @@ bool nx_media_select_track(nx_media_t *m, int id, bool subtitle);
 std::string nx_media_track_error(nx_media_t *m);
 std::string nx_media_subtitle_text(nx_media_t *m, double seconds);
 
+// Image subtitles (Blu-ray PGS, DVD and DVB): each displayed subtitle is one
+// or more rectangles of straight (non-premultiplied) RGBA pixels, positioned
+// in a canvas of `canvas_width` x `canvas_height` (the coordinate space the
+// subtitles were authored for, usually the full video frame).
+struct nx_media_subtitle_image {
+	int x = 0, y = 0, width = 0, height = 0;
+	std::vector<uint8_t> rgba;
+};
+
+// The image subtitle showing at `seconds`: returns its id (> 0) or 0 when none.
+// Pixels are copied out only when the id differs from `known_id`, so callers
+// can poll every frame and redraw only on change.
+uint64_t nx_media_subtitle_bitmap(nx_media_t *m, double seconds, uint64_t known_id, int *canvas_width,
+                                  int *canvas_height, std::vector<nx_media_subtitle_image> *rects);
+
 // Attach the audio output. `node` must be an NX_AUDIO_NODE_STREAM_SOURCE
 // whose graph runs at `sample_rate`; the decoder resamples the audio track
 // to interleaved stereo f32 at that rate. The caller owns the node and must

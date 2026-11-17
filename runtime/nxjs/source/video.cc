@@ -356,6 +356,43 @@ void nx_video_subtitle_text(const FunctionCallbackInfo<Value> &info) {
 	info.GetReturnValue().Set(nx_str_lossy(iso, text.c_str()));
 }
 
+// videoSubtitleBitmap(video, seconds, knownId) -> the image subtitle (PGS/DVD/DVB)
+// showing at `seconds`: its id as a number when nothing changed (0 = none), or
+// { id, width, height, rects: [{ x, y, width, height, data: ArrayBuffer RGBA }] }
+// when a different one is showing. Pixels cross into JS only on change.
+void nx_video_subtitle_bitmap(const FunctionCallbackInfo<Value> &info) {
+	Isolate *iso = info.GetIsolate();
+	nx_video_t *v = get_video(iso, info[0]);
+	if (!v) return;
+	if (!v->media) { info.GetReturnValue().Set(Integer::New(iso, 0)); return; }
+	const double known_arg = arg_f64(info, 2);
+	const uint64_t known = known_arg > 0 ? (uint64_t)known_arg : 0;
+	int canvas_width = 0, canvas_height = 0;
+	std::vector<nx_media_subtitle_image> rects;
+	const uint64_t id = nx_media_subtitle_bitmap(v->media, arg_f64(info, 1), known, &canvas_width, &canvas_height, &rects);
+	if (id == 0 || id == known) { info.GetReturnValue().Set(Number::New(iso, (double)id)); return; }
+	Local<Context> context = iso->GetCurrentContext();
+	Local<Object> result = Object::New(iso);
+	result->Set(context, nx_str(iso, "id"), Number::New(iso, (double)id)).Check();
+	result->Set(context, nx_str(iso, "width"), Integer::New(iso, canvas_width)).Check();
+	result->Set(context, nx_str(iso, "height"), Integer::New(iso, canvas_height)).Check();
+	Local<Array> list = Array::New(iso, (int)rects.size());
+	for (size_t i = 0; i < rects.size(); i++) {
+		const nx_media_subtitle_image &r = rects[i];
+		Local<ArrayBuffer> pixels = ArrayBuffer::New(iso, r.rgba.size());
+		if (!r.rgba.empty()) memcpy(pixels->GetBackingStore()->Data(), r.rgba.data(), r.rgba.size());
+		Local<Object> rect = Object::New(iso);
+		rect->Set(context, nx_str(iso, "x"), Integer::New(iso, r.x)).Check();
+		rect->Set(context, nx_str(iso, "y"), Integer::New(iso, r.y)).Check();
+		rect->Set(context, nx_str(iso, "width"), Integer::New(iso, r.width)).Check();
+		rect->Set(context, nx_str(iso, "height"), Integer::New(iso, r.height)).Check();
+		rect->Set(context, nx_str(iso, "data"), pixels).Check();
+		list->Set(context, (uint32_t)i, rect).Check();
+	}
+	result->Set(context, nx_str(iso, "rects"), list).Check();
+	info.GetReturnValue().Set(result);
+}
+
 void nx_video_set_render_size(const FunctionCallbackInfo<Value> &info) {
 	Isolate *iso = info.GetIsolate();
 	nx_video_t *v = get_video(iso, info[0]);
@@ -600,6 +637,7 @@ void nx_init_video(Isolate *iso, Local<Object> init_obj) {
 	NX_SET_FUNC(init_obj, "videoTracks", nx_video_tracks);
 	NX_SET_FUNC(init_obj, "videoSelectTrack", nx_video_select_track);
 	NX_SET_FUNC(init_obj, "videoSubtitleText", nx_video_subtitle_text);
+	NX_SET_FUNC(init_obj, "videoSubtitleBitmap", nx_video_subtitle_bitmap);
 	NX_SET_FUNC(init_obj, "videoSetLoop", nx_video_set_loop);
 	NX_SET_FUNC(init_obj, "videoTick", nx_video_tick);
 	NX_SET_FUNC(init_obj, "videoState", nx_video_state);

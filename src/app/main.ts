@@ -19,11 +19,11 @@ import { ThumbnailCache } from './posters';
 import { TorrentSessions } from './sessions';
 import { attachTouch } from './touch';
 import { UiModel, type UiServices } from './ui';
-import { drawOsd, drawSubtitles, drawUi, hitTest, type HitRect } from './ui-draw';
+import { drawOsd, drawSubtitleImage, drawSubtitles, drawUi, hitTest, type HitRect } from './ui-draw';
 import { loadSettings, saveSettings, type Settings } from './settings';
 import { promptKeyboard, type KeyboardLike } from './keyboard';
 
-const BUILD = 'stremio-nx build 0.3.0-search-decode-20261116';
+const BUILD = 'stremio-nx build 0.4.0-pgs-20261116';
 
 const CONTROL_PORT = 11470;
 const ADDON_PORT = 11471;
@@ -204,7 +204,10 @@ function startPresenting(state: AppState): void {
 				else ctx.fillRect(x, y, w, h);
 				probes.drawMaxMs = Math.max(probes.drawMaxMs, performance.now() - drawStart);
 				hits = [];
-				if (state.diag === 0) drawSubtitles(ctx, subtitle, ui.osd.visible);
+				if (state.diag === 0) {
+					drawSubtitleImage(ctx, player?.subtitleImage());
+					drawSubtitles(ctx, subtitle, ui.osd.visible);
+				}
 				// Playback state (several native queries) only when the controls show it.
 				if (state.diag < 2) drawOsd(ctx, ui, ui.osd.visible ? player?.playback() ?? null : null, hits);
 				if (state.showStats) {

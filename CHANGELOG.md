@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.0: image subtitles (PGS, VobSub, DVB)
+
+### Added (native runtime: needs a from-source build, see docs/building.md)
+- **Blu-ray PGS subtitles** (`hdmv_pgs_subtitle`), plus DVD VobSub and DVB image subtitles, are now selectable. Before, they were listed as unsupported.
+- The decoder turns each subtitle image into RGBA once, on the decode thread. It keeps each one showing until the next subtitle event, since PGS subtitles end when an empty update clears them. Pixels are handed to the app only when the subtitle changes.
+- Subtitles are drawn in the coordinate space the disc was authored for, fitted to the screen. That also places them correctly on cropped (letterboxed) encodes, and the subtitle delay setting applies to them.
+- The track menu shows readable formats: PGS (image), VobSub (image), SRT, ASS and so on.
+- On runtimes without this support (an NRO built from an older runtime), image tracks stay marked unsupported. Nothing else changes.
+
+### Developer
+- `npm run native-check` now also writes a PGS stream (`host-test/native/make-pgs.py`, Python + Pillow) and checks the real decoder's timing, placement and pixels.
+
 ## 0.3.0: search rewrite and faster video decoding
 
 ### Search, rewritten

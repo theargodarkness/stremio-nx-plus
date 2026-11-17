@@ -872,6 +872,18 @@ export interface Init {
 	videoTracks(video: VideoHandle, subtitle: boolean): VideoMediaTrack[];
 	videoSelectTrack(video: VideoHandle, id: number, subtitle: boolean): void;
 	videoSubtitleText(video: VideoHandle, seconds: number): string;
+	videoSubtitleBitmap(
+		video: VideoHandle,
+		seconds: number,
+		knownId: number,
+	):
+		| number
+		| {
+				id: number;
+				width: number;
+				height: number;
+				rects: { x: number; y: number; width: number; height: number; data: ArrayBuffer }[];
+		  };
 	videoSetLoop(video: VideoHandle, loop: boolean): void;
 	videoTick(video: VideoHandle): boolean;
 	videoState(video: VideoHandle): VideoPlaybackState;

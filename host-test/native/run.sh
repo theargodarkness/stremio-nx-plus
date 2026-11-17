@@ -6,6 +6,9 @@
 #   1. frame-convert-check: two-core conversion vs the previous single-thread
 #      path on NV12 frames of a 1080p clip (speed, byte-exactness, colours).
 #   2. decoder-e2e: the real media-decoder.cc playing the clip for 3 s.
+#   3. decoder-pgs: Blu-ray PGS image subtitles (a stream written by
+#      make-pgs.py, needs Python + Pillow) decoded with the right timing,
+#      placement and RGBA pixels.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SRC="$HERE/../../runtime/nxjs/source"
@@ -18,5 +21,15 @@ LIBS="$(pkg-config --cflags --libs libavformat libavcodec libswscale libswresamp
 g++ -std=c++20 -O2 -pthread -I"$SRC" "$HERE/frame-convert-check.cc" "$SRC/frame-convert.cc" $LIBS -o "$OUT/frame-convert-check"
 g++ -std=c++20 -O2 -pthread -I"$SRC" "$HERE/decoder-e2e.cc" "$SRC/media-decoder.cc" "$SRC/media-source.cc" \
 	"$SRC/http-reader.cc" "$SRC/audio-graph.cc" "$SRC/frame-convert.cc" $LIBS -o "$OUT/decoder-e2e"
+g++ -std=c++20 -O2 -pthread -I"$SRC" "$HERE/decoder-pgs.cc" "$SRC/media-decoder.cc" "$SRC/media-source.cc" \
+	"$SRC/http-reader.cc" "$SRC/audio-graph.cc" "$SRC/frame-convert.cc" $LIBS -o "$OUT/decoder-pgs"
 "$OUT/frame-convert-check" "$CLIP"
 "$OUT/decoder-e2e" "$CLIP"
+if python3 -c 'import PIL' 2>/dev/null; then
+	python3 "$HERE/make-pgs.py" "$OUT/test.sup" >/dev/null
+	# -copyts keeps the subtitle timestamps as authored (no re-basing to 0).
+	ffmpeg -hide_banner -loglevel error -y -copyts -i "$CLIP" -i "$OUT/test.sup" -map 0:v -map 1:s -c copy "$OUT/clip-pgs.mkv"
+	"$OUT/decoder-pgs" "$OUT/clip-pgs.mkv"
+else
+	echo "skipping the PGS check: python3 with Pillow is needed to write the test subtitles"
+fi

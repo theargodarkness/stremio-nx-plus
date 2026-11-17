@@ -44,6 +44,8 @@ export class MediaPlayer {
 	subtitleDelay = 0;
 	subtitleNotice = '';
 	#subtitleSelection = 'off';
+	#imageId = 0;
+	#image?: SubtitleImage;
 	#subtitleOptions: SubtitleOption[] = [];
 	#cues: Cue[] = [];
 	#subtitleSearch = new AbortController();
@@ -93,7 +95,7 @@ export class MediaPlayer {
 		const v = this.#video;
 		const native = kind === 'audio' ? v.audioTracks : v.subtitleTracks;
 		const rows = native.map(t => ({ id: kind === 'audio' ? String(t.id) : `embedded:${t.id}`,
-			label: `${t.language}${t.label ? ' · ' + t.label : ''} · ${t.codec}${!t.supported ? ' (unsupported)' : ''}`,
+			label: `${t.language}${t.label ? ' · ' + t.label : ''} · ${codecLabel(t.codec)}${!t.supported ? ' (unsupported)' : ''}`,
 			selected: kind === 'audio' ? t.id === v.selectedAudioTrack : this.#subtitleSelection === `embedded:${t.id}`, enabled: t.supported }));
 		if (kind === 'audio') return rows;
 		return [{ id: 'off', label: 'Off', selected: this.#subtitleSelection === 'off', enabled: true }, ...rows,
@@ -116,7 +118,36 @@ export class MediaPlayer {
 		else if (this.#video.selectedSubtitleTrack >= 0) this.#video.selectSubtitleTrack(-1);
 		this.#cues = cues;
 		this.#subtitleSelection = id;
+		this.#imageId = 0;
+		this.#image = undefined;
 		this.#opts.onChanged?.();
+	}
+
+	/**
+	 * The image subtitle (Blu-ray PGS, DVD, DVB) to draw now, if the selected
+	 * embedded track is one. Pixels come from the runtime only when the
+	 * subtitle changes; each rectangle becomes an offscreen canvas once.
+	 */
+	subtitleImage(): SubtitleImage | undefined {
+		if (!this.#subtitleSelection.startsWith('embedded:')) return undefined;
+		const v = this.#video;
+		if (typeof v.getSubtitleBitmap !== 'function') return undefined;
+		const result = v.getSubtitleBitmap(v.currentTime - this.subtitleDelay, this.#imageId);
+		if (typeof result === 'number') {
+			if (result === 0) { this.#imageId = 0; this.#image = undefined; }
+			return this.#image;
+		}
+		this.#imageId = result.id;
+		this.#image = {
+			canvasWidth: result.width,
+			canvasHeight: result.height,
+			parts: result.rects.filter(r => r.width > 0 && r.height > 0).map(r => {
+				const canvas = new OffscreenCanvas(r.width, r.height);
+				canvas.getContext('2d')!.putImageData(new ImageData(new Uint8ClampedArray(r.data), r.width, r.height), 0, 0);
+				return { canvas, x: r.x, y: r.y, width: r.width, height: r.height };
+			}),
+		};
+		return this.#image;
 	}
 
 	subtitleText(): string {
@@ -430,4 +461,21 @@ export class MediaPlayer {
 		this.#video.src = '';
 		this.video = undefined;
 	}
+}
+
+/** An image subtitle ready to draw: rectangles in the subtitle canvas's coordinates. */
+export interface SubtitleImage {
+	canvasWidth: number;
+	canvasHeight: number;
+	parts: { canvas: OffscreenCanvas; x: number; y: number; width: number; height: number }[];
+}
+
+const CODEC_LABELS: Record<string, string> = {
+	hdmv_pgs_subtitle: 'PGS (image)', dvd_subtitle: 'VobSub (image)', dvb_subtitle: 'DVB (image)',
+	subrip: 'SRT', ass: 'ASS', ssa: 'SSA', mov_text: 'Text', webvtt: 'WebVTT',
+};
+
+/** Readable codec names for the track menu. */
+export function codecLabel(codec: string): string {
+	return CODEC_LABELS[codec] ?? codec;
 }

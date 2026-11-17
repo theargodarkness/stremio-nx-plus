@@ -1,14 +1,14 @@
-# Stremio NX Plus
+# Stremio NX
 
 ![Stremio NX](assets/logo.png)
 
 An independent video player for Nintendo Switch homebrew, compatible with Stremio add-ons.
 
-Browse catalogs and play torrents or direct HTTP links, including compatible debrid streams. Supports subtitles, audio-track selection, add-on management, controller input, filtering, touch, and more.
+Browse catalogs and play torrents or direct HTTP links, including compatible debrid streams. Supports subtitles, audio-track selection, add-on management, controller input and touch.
 
 ## Install
 
-1. Download `stremio-nx.nro` from Releases, under Assets.
+1. Download `stremio-nx.nro` from [Releases](https://github.com/jrgf/stremio-nx/releases), under Assets.
 2. Copy `stremio-nx.nro` to `/switch/` on your SD card.
 3. Open the Homebrew Menu through title override by holding R while launching a game, then start Stremio NX.
 
@@ -24,13 +24,17 @@ Browse catalogs and play torrents or direct HTTP links, including compatible deb
 | X | On a stream list: show or hide the streams your filters removed |
 | + | Exit |
 
+## Subtitles
+
+Press Y during playback to choose a subtitle track. Text subtitles (SRT, ASS, WebVTT, add-on subtitles) and image subtitles from Blu-rays and DVDs (PGS, VobSub, DVB) are supported. Image subtitles need a runtime built from this source (see docs/building.md).
+
 ## Stream filters
 
 Open **Settings** (the gear at the bottom of the rail) to choose which streams appear. The defaults suit the Switch:
 
 | Setting | Default | Why |
 | --- | --- | --- |
-| Maximum resolution | 1080p (OC recommended, 720p non-OC) | 4K decodes and scales poorly on the Switch |
+| Maximum resolution | 1080p | 4K decodes and scales poorly on the Switch |
 | Hide HDR | On | No HDR tone mapping: HDR10/HDR10+/HLG look washed out |
 | Hide Dolby Vision | On | DV-only files show green/purple colours |
 | Hide AV1 and 10-bit H.264 | On | No hardware decoder; software decoding drops frames |

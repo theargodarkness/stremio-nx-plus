@@ -47,4 +47,17 @@ interface Video {
 	selectAudioTrack(id: number): void;
 	selectSubtitleTrack(id: number): void;
 	getSubtitleText(seconds?: number): string;
+	/**
+	 * Image subtitles (PGS/DVD/DVB): the current one's id when it equals
+	 * `knownId` (0 = none), else its canvas size and RGBA rectangles.
+	 * Absent on runtimes built before image-subtitle support.
+	 */
+	getSubtitleBitmap?(seconds?: number, knownId?: number): number | SubtitleBitmapData;
+}
+
+interface SubtitleBitmapData {
+	id: number;
+	width: number;
+	height: number;
+	rects: { x: number; y: number; width: number; height: number; data: ArrayBuffer }[];
 }

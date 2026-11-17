@@ -89,6 +89,16 @@ struct nx_media {
 	struct subtitle_cue { double start, end; std::string text; };
 	std::mutex subtitle_mutex;
 	std::deque<subtitle_cue> subtitles;
+	// Image subtitles (PGS/DVD/DVB). A PGS subtitle has no end time: it shows
+	// until the next display set, which may be an empty one that clears it.
+	struct bitmap_cue {
+		uint64_t id;
+		double start, end;
+		int canvas_width, canvas_height;
+		std::vector<nx_media_subtitle_image> rects;
+	};
+	std::deque<bitmap_cue> bitmap_subtitles;
+	uint64_t next_bitmap_id = 1;
 	std::string track_error;
 	SwsContext *sws = nullptr; // single-threaded fallback conversion
 	// Two-core BGRA conversion (decode thread + helper on another core).
@@ -508,6 +518,7 @@ bool container_seek(nx_media *m, double to_seconds) {
 	{
 		std::lock_guard<std::mutex> lock(m->subtitle_mutex);
 		m->subtitles.clear();
+		m->bitmap_subtitles.clear();
 	}
 	if (m->swr) {
 		swr_free(&m->swr); // drop resampler delay state
@@ -603,6 +614,56 @@ std::string subtitle_plain_text(const AVSubtitleRect *rect) {
 	return out;
 }
 
+// Limits for image cues: the deque and each cue's pixels (a full 1080p frame is ~8 MiB).
+constexpr size_t MAX_BITMAP_CUES = 24;
+constexpr size_t MAX_BITMAP_BYTES = 16u << 20;
+
+bool is_bitmap_subtitle_codec(const AVCodecContext *ctx) {
+	const AVCodecDescriptor *desc = ctx ? avcodec_descriptor_get(ctx->codec_id) : nullptr;
+	return desc && (desc->props & AV_CODEC_PROP_BITMAP_SUB);
+}
+
+// Store an image subtitle event. Every event (including an empty one) ends
+// whatever was showing before it; rectangles are converted from 8-bit
+// palette indices to RGBA once, here on the decode thread.
+void store_bitmap_subtitle(nx_media *m, const AVSubtitle &sub, double start, double end, double seek_drop_until) {
+	nx_media::bitmap_cue cue{};
+	cue.start = start;
+	cue.end = end;
+	// The authoring canvas: PGS declares it; DVD/DVB fall back to the video frame.
+	cue.canvas_width = m->sctx->width > 0 ? m->sctx->width : m->width;
+	cue.canvas_height = m->sctx->height > 0 ? m->sctx->height : m->height;
+	size_t bytes = 0;
+	for (unsigned i = 0; i < sub.num_rects; ++i) {
+		const AVSubtitleRect *r = sub.rects[i];
+		if (!r || r->type != SUBTITLE_BITMAP || r->w <= 0 || r->h <= 0 || r->w > 4096 || r->h > 4096 || !r->data[0] || !r->data[1]) continue;
+		const size_t size = (size_t)r->w * r->h * 4;
+		if (bytes + size > MAX_BITMAP_BYTES) break;
+		bytes += size;
+		nx_media_subtitle_image img;
+		img.x = r->x; img.y = r->y; img.width = r->w; img.height = r->h;
+		img.rgba.resize(size);
+		const uint32_t *palette = reinterpret_cast<const uint32_t *>(r->data[1]); // 0xAARRGGBB, 256 entries
+		const int colors = r->nb_colors > 0 && r->nb_colors <= 256 ? r->nb_colors : 256;
+		uint8_t *out = img.rgba.data();
+		for (int y = 0; y < r->h; ++y) {
+			const uint8_t *row = r->data[0] + (size_t)y * r->linesize[0];
+			for (int x = 0; x < r->w; ++x, out += 4) {
+				const uint32_t c = row[x] < colors ? palette[row[x]] : 0;
+				out[0] = (c >> 16) & 0xff; out[1] = (c >> 8) & 0xff; out[2] = c & 0xff; out[3] = (c >> 24) & 0xff;
+			}
+		}
+		cue.rects.push_back(std::move(img));
+	}
+	std::lock_guard<std::mutex> lock(m->subtitle_mutex);
+	for (auto &prev : m->bitmap_subtitles)
+		if (prev.start < start && prev.end > start) prev.end = start;
+	if (cue.rects.empty() || end <= start || (seek_drop_until >= 0 && end <= seek_drop_until)) return;
+	if (m->bitmap_subtitles.size() >= MAX_BITMAP_CUES) m->bitmap_subtitles.pop_front();
+	cue.id = m->next_bitmap_id++;
+	m->bitmap_subtitles.push_back(std::move(cue));
+}
+
 void decode_subtitle(nx_media *m, AVPacket *pkt, double seek_drop_until) {
 	AVSubtitle sub = {};
 	int got = 0;
@@ -613,6 +674,14 @@ void decode_subtitle(nx_media *m, AVPacket *pkt, double seek_drop_until) {
 	double pts = sub.pts != AV_NOPTS_VALUE ? (double)sub.pts / AV_TIME_BASE
 	    : pkt->pts != AV_NOPTS_VALUE ? pkt->pts * av_q2d(m->fmt->streams[m->sstream]->time_base) : 0;
 	double start = pts + sub.start_display_time / 1000.0 + m->loop_offset;
+	if (is_bitmap_subtitle_codec(m->sctx)) {
+		// No (or an "until further notice") end time: shown until the next event replaces it.
+		const bool open_ended = sub.end_display_time == 0 || sub.end_display_time == UINT32_MAX || sub.end_display_time <= sub.start_display_time;
+		const double end = open_ended ? INFINITY : pts + sub.end_display_time / 1000.0 + m->loop_offset;
+		store_bitmap_subtitle(m, sub, start, end, seek_drop_until);
+		avsubtitle_free(&sub);
+		return;
+	}
 	double end = pts + sub.end_display_time / 1000.0 + m->loop_offset;
 	if (end <= start && pkt->duration > 0) end = start + pkt->duration * av_q2d(m->fmt->streams[m->sstream]->time_base);
 	std::string text;
@@ -879,7 +948,9 @@ nx_media_t *nx_media_open(const char *path, const uint8_t *mem,
 		if (par->codec_type != AVMEDIA_TYPE_AUDIO && par->codec_type != AVMEDIA_TYPE_SUBTITLE) continue;
 		const AVCodecDescriptor *desc = avcodec_descriptor_get(par->codec_id);
 		bool subtitle = par->codec_type == AVMEDIA_TYPE_SUBTITLE;
-		bool supported = avcodec_find_decoder(par->codec_id) && (!subtitle || (desc && (desc->props & AV_CODEC_PROP_TEXT_SUB)));
+		// Text subtitles render as text, image ones (PGS/DVD/DVB) as pictures.
+		bool supported = avcodec_find_decoder(par->codec_id) &&
+		                 (!subtitle || (desc && (desc->props & (AV_CODEC_PROP_TEXT_SUB | AV_CODEC_PROP_BITMAP_SUB))));
 		const AVDictionaryEntry *language = av_dict_get(stream->metadata, "language", nullptr, 0);
 		const AVDictionaryEntry *title = av_dict_get(stream->metadata, "title", nullptr, 0);
 		m->tracks.push_back({(int)i, subtitle, supported,
@@ -928,7 +999,7 @@ bool nx_media_select_track(nx_media_t *m, int id, bool subtitle) {
 	{
 		std::lock_guard<std::mutex> lock(m->subtitle_mutex);
 		m->track_error.clear();
-		if (subtitle) m->subtitles.clear();
+		if (subtitle) { m->subtitles.clear(); m->bitmap_subtitles.clear(); }
 	}
 	if (subtitle) m->requested_subtitle.store(id);
 	else m->requested_audio.store(id);
@@ -955,6 +1026,26 @@ std::string nx_media_subtitle_text(nx_media_t *m, double seconds) {
 		++it;
 	}
 	return text.substr(0, 4096);
+}
+
+uint64_t nx_media_subtitle_bitmap(nx_media_t *m, double seconds, uint64_t known_id, int *canvas_width,
+                                  int *canvas_height, std::vector<nx_media_subtitle_image> *rects) {
+	if (m->seeking.load() || !std::isfinite(seconds)) return 0;
+	std::lock_guard<std::mutex> lock(m->subtitle_mutex);
+	const nx_media::bitmap_cue *showing = nullptr;
+	for (auto it = m->bitmap_subtitles.begin(); it != m->bitmap_subtitles.end();) {
+		// Keep a little history for subtitle delay adjustments; pixels are large.
+		if (it->end < seconds - 30) { it = m->bitmap_subtitles.erase(it); continue; }
+		if (it->start <= seconds && it->end > seconds && (!showing || it->start >= showing->start)) showing = &*it;
+		++it;
+	}
+	if (!showing) return 0;
+	if (showing->id != known_id) {
+		*canvas_width = showing->canvas_width;
+		*canvas_height = showing->canvas_height;
+		*rects = showing->rects;
+	}
+	return showing->id;
 }
 
 void nx_media_set_audio_node(nx_media_t *m, nx_audio_node *node,

@@ -796,6 +796,19 @@ function drawTracks(ctx: CanvasRenderingContext2D, ui: UiModel, hits: HitRect[])
 	ctx.fillText('L/R tabs   ↑↓ choose   A select   ◀▶ subtitle delay   B close', 212, 622);
 }
 
+/**
+ * Image subtitles: the subtitle canvas (usually the full Blu-ray frame) is
+ * fitted to the screen and centred, which also places subtitles correctly
+ * for cropped (letterboxed) video encoded smaller than that canvas.
+ */
+export function drawSubtitleImage(ctx: CanvasRenderingContext2D, image: { canvasWidth: number; canvasHeight: number; parts: { canvas: OffscreenCanvas; x: number; y: number; width: number; height: number }[] } | undefined): void {
+	if (!image || image.canvasWidth <= 0 || image.canvasHeight <= 0) return;
+	const scale = Math.min(W / image.canvasWidth, H / image.canvasHeight);
+	const ox = (W - image.canvasWidth * scale) / 2;
+	const oy = (H - image.canvasHeight * scale) / 2;
+	for (const p of image.parts) ctx.drawImage(p.canvas, ox + p.x * scale, oy + p.y * scale, p.width * scale, p.height * scale);
+}
+
 export function drawSubtitles(ctx: CanvasRenderingContext2D, text: string, raised: boolean): void {
 	if (!text) return;
 	ctx.font = '28px sans-serif';
