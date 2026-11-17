@@ -43,4 +43,21 @@ export class Input {
 	pressed(button: Button): boolean {
 		return this.#pressed.has(button);
 	}
+
+	/**
+	 * Adopt the pad's current state without reporting presses: buttons still
+	 * held (the A or + that confirmed the keyboard) must be released before
+	 * they count, or they would act on the screen behind the keyboard.
+	 */
+	sync(now: number): void {
+		this.#pressed.clear();
+		this.#down.clear();
+		const pad = navigator.getGamepads()[0];
+		for (const name of Object.keys(INDEX) as Button[]) {
+			if (!pad?.buttons[INDEX[name]]?.pressed) continue;
+			this.#down.add(name);
+			this.#heldSince.set(name, now);
+			this.#lastRepeat.set(name, now);
+		}
+	}
 }

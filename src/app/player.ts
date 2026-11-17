@@ -28,6 +28,12 @@ export interface PlayerOptions {
 	onChanged?: () => void;
 	onError?: (error: Error) => void;
 	subtitles?: { addons: Addon[]; type: string; videoId: string };
+	/**
+	 * Verbose per-second stats and native heap sampling. Off: the stats tick
+	 * only adapts HTTP lanes and refreshes the status overlay, skipping the
+	 * heap walk (10-30 ms JS stalls) and the long log line built every second.
+	 */
+	diagnostics?: () => boolean;
 }
 
 export class MediaPlayer {
@@ -134,7 +140,7 @@ export class MediaPlayer {
 	}
 
 	/** Position, length, pause and buffering state for the on-screen display. */
-	playback(): { time: number; duration: number; paused: boolean; buffering: boolean; aheadMiB: number } {
+	playback(): { time: number; duration: number; paused: boolean; buffering: boolean; aheadMiB: number; notice?: string } {
 		const duration = this.#video.duration;
 		const pos = this.#source.position;
 		return {
@@ -144,6 +150,10 @@ export class MediaPlayer {
 			// The decoder is blocked on bytes we have not provided yet.
 			buffering: this.#started && !this.#userPaused && (this.#rebuffering || this.#source.wanted >= 0),
 			aheadMiB: this.#source.buffered(pos) / MiB,
+			// Unlabelled 4K slips past the stream filters; say why it may stutter.
+			notice: this.#started && (this.#video.videoWidth > 2048 || this.#video.videoHeight > 1200)
+				? `${this.#video.videoWidth}x${this.#video.videoHeight} source: above what the Switch plays smoothly. Pick a 1080p stream if it stutters.`
+				: undefined,
 		};
 	}
 
@@ -325,13 +335,17 @@ export class MediaPlayer {
 		let lastRatePos = 0, lastSeekEpoch = this.#seekEpoch;
 		let lastStatsAt = performance.now();
 		let statsMs = 0;
+		let wasStalled = false;
+		const verbose = () => this.#opts.diagnostics?.() ?? true;
 		// Switch.memoryUsage() walks the native heap (mallinfo: 10-30 ms, growing
-		// with fragmentation), so it is sampled every MEMORY_SAMPLE_MS, not per tick.
-		let heap = Switch.memoryUsage();
+		// with fragmentation), so it is sampled every MEMORY_SAMPLE_MS, not per
+		// tick, and only while diagnostics are on.
+		let heap: ReturnType<typeof Switch.memoryUsage> | undefined = verbose() ? Switch.memoryUsage() : undefined;
 		let heapSampledAt = lastStatsAt;
 		this.#stats = setInterval(() => {
 			const tickStart = performance.now();
-			if (tickStart - heapSampledAt >= MEMORY_SAMPLE_MS) {
+			const diagnostics = verbose();
+			if (diagnostics && (!heap || tickStart - heapSampledAt >= MEMORY_SAMPLE_MS)) {
 				heap = Switch.memoryUsage();
 				heapSampledAt = tickStart;
 			}
@@ -364,9 +378,13 @@ export class MediaPlayer {
 			lastSeekEpoch = this.#seekEpoch;
 			const stalled = this.#started && !video.paused && lastTime >= 0 && t <= lastTime + 0.05;
 			lastTime = t;
+			const q = video.getVideoPlaybackQuality();
+			// Without diagnostics, record only the start of a stall (each event line rewrites the log file).
+			if (stalled && !wasStalled && !diagnostics) log(`stall at t=${t.toFixed(0)}s ahead ${aheadMiB} MiB`);
+			wasStalled = stalled;
+			if (diagnostics && heap) {
 			const memory = engine?.memoryUsage();
 			const native = heap as unknown as { totalPhysicalSize?: number; nativeHeapTotal?: number; nativeHeapUsed?: number; dataArenaUsed?: number; dataArenaCommitted?: number; dataArenaSize?: number };
-			const q = video.getVideoPlaybackQuality();
 			const frame = video.getFrameStats();
 			// Negative: the longest render pause ended before this tick; near 0: right at it.
 			const gapPhase = probes.gapAtMs ? Math.round(probes.gapAtMs - tickStart) : 0;
@@ -379,6 +397,7 @@ export class MediaPlayer {
 					`diag ${probes.diag} conn ${s ? `${s.connectAttempts - s.connectFailures}/${s.connectAttempts}` : 'HTTP'} | heap ${(heap.usedHeapSize / MiB).toFixed(0)}/${(heap.heapSizeLimit / MiB).toFixed(0)} MiB ext ${((heap as unknown as { externalMemory?: number }).externalMemory ?? 0) / MiB | 0} v8malloc ${((heap as unknown as { mallocedMemory?: number }).mallocedMemory ?? 0) / MiB | 0} native ${((heap as unknown as { nativeHeapUsed?: number }).nativeHeapUsed ?? 0) / MiB | 0} MiB | pos ${(pos / MiB).toFixed(1)}`,
 				true,
 			);
+			}
 			this.status =
 				`t=${t.toFixed(0)}s | ahead ${aheadMiB} MiB | ${s ? `peers ${s.peers} | pieces ${s.completedPieces}/${s.totalPieces}` : 'HTTP stream'} | ` +
 				`${video.decoder} | frames ${q.totalVideoFrames}/${q.droppedVideoFrames} dropped | gap ${feedGapMs.toFixed(0)} ms`;

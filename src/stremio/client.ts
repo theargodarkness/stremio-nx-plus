@@ -82,6 +82,10 @@ export interface StreamOption {
 export interface MetaDetails {
 	meta: MetaItem;
 	streams: StreamOption[];
+	/** Stream add-ons that have not answered yet (updates follow through `onUpdate`). */
+	pendingAddons?: number;
+	/** Stream add-ons that failed or timed out. */
+	failedAddons?: number;
 }
 
 export interface StreamingServerState {
@@ -93,6 +97,7 @@ export interface StreamingServerState {
 }
 
 interface DetailsState {
+	selected?: { streamPath?: { id?: string } | null } | null;
 	metaItem: { content: Loadable<MetaItem> } | null;
 	streams: { addon: { manifest: { name: string }; transportUrl: string }; content: Loadable<Stream[]> }[];
 }
@@ -115,6 +120,8 @@ export interface CatalogRow {
 	items: MetaPreview[];
 	/** The catalog to open for "see all" (resolved from the installed addons). */
 	ref?: CatalogRef;
+	/** Still waiting for the add-on (progressive updates only). */
+	loading?: boolean;
 }
 
 interface CatalogsWithExtraState {
@@ -131,10 +138,13 @@ interface ContinueWatchingState {
 
 export const CINEMETA = 'https://v3-cinemeta.strem.io/manifest.json';
 const DEFAULT_TIMEOUT_MS = 30000;
+/** How long progressive loads keep waiting for slow add-ons before showing what arrived. */
+const SLOW_ADDON_MS = 25000;
 
 export class StremioClient {
 	#core: StremioCore;
-	#waiters = new Map<string, () => void>();
+	/** Change listeners per state field (several flows may wait on one field). */
+	#waiters = new Map<string, Set<() => void>>();
 	#log: (msg: string) => void;
 	#changingAddons = false;
 
@@ -150,7 +160,7 @@ export class StremioClient {
 		let client: StremioClient | undefined;
 		const core = await createCore((event: CoreEvent) => {
 			if (event.name === 'NewState' && Array.isArray(event.args)) {
-				if (client) for (const field of event.args) client.#waiters.get(field)?.();
+				if (client) for (const field of event.args) { const set = client.#waiters.get(field); if (set) for (const fn of [...set]) fn(); }
 			} else if (event.name === 'CoreEvent') {
 				// Add-on descriptors can contain private configuration tokens in URLs.
 				log(`core event: ${(event.args as { event?: string } | null)?.event ?? 'update'}`);
@@ -168,22 +178,66 @@ export class StremioClient {
 		return this.#core.getState<T>(field);
 	}
 
+	/** Calls `fn` on every change of `field` until the returned function is called. */
+	watch(field: string, fn: () => void): () => void {
+		let set = this.#waiters.get(field);
+		if (!set) this.#waiters.set(field, set = new Set());
+		set.add(fn);
+		return () => {
+			set.delete(fn);
+			if (set.size === 0 && this.#waiters.get(field) === set) this.#waiters.delete(field);
+		};
+	}
+
 	/** Resolves with the state of `field` once `ready` holds (checked now and on every change). */
 	waitState<T>(field: string, ready: (state: T) => boolean, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<T> {
 		return new Promise<T>((resolve, reject) => {
+			let unwatch = () => {};
 			const timer = setTimeout(() => {
-				this.#waiters.delete(field);
+				unwatch();
 				reject(new Error(`${field}: timed out`));
 			}, timeoutMs);
 			const check = () => {
 				const state = this.#core.getState<T>(field);
-				if (!ready(state)) return;
+				if (!ready(state)) return false;
 				clearTimeout(timer);
-				this.#waiters.delete(field);
+				unwatch();
+				resolve(state);
+				return true;
+			};
+			if (!check()) unwatch = this.watch(field, check);
+		});
+	}
+
+	/**
+	 * Follow `field` until `done` holds, the state stops being ours (`current`
+	 * false: the user opened something else), or `timeoutMs` passes; `update`
+	 * runs on every change and once more at the end with `final` set.
+	 */
+	#follow<T>(field: string, opts: { current: (s: T) => boolean; done: (s: T) => boolean; update: (s: T, final: boolean) => void; timeoutMs: number }): Promise<T> {
+		return new Promise<T>((resolve) => {
+			let finished = false;
+			let unwatch = () => {};
+			const finish = (state: T, report: boolean) => {
+				if (finished) return;
+				finished = true;
+				clearTimeout(timer);
+				unwatch();
+				if (report) opts.update(state, true);
 				resolve(state);
 			};
-			this.#waiters.set(field, check);
+			const timer = setTimeout(() => {
+				const state = this.#core.getState<T>(field);
+				finish(state, opts.current(state));
+			}, opts.timeoutMs);
+			const check = () => {
+				const state = this.#core.getState<T>(field);
+				if (!opts.current(state)) return finish(state, false);
+				if (opts.done(state)) return finish(state, true);
+				opts.update(state, false);
+			};
 			check();
+			if (!finished) unwatch = this.watch(field, check);
 		});
 	}
 
@@ -227,33 +281,54 @@ export class StremioClient {
 		return out;
 	}
 
-	/** The board: every addon catalog (no type filter), the first `rows` loaded. */
-	loadBoard(rows = 8): Promise<CatalogRow[]> {
-		return this.#loadCatalogRows('board', [], rows);
+	/**
+	 * The board: every addon catalog (no type filter), the first `rows` loaded.
+	 * `onUpdate` receives the rows as they arrive (still-loading ones flagged);
+	 * the promise resolves with the final rows, dropping add-ons that failed or
+	 * are still silent after SLOW_ADDON_MS instead of failing the whole board.
+	 */
+	loadBoard(rows = 8, onUpdate?: (rows: CatalogRow[]) => void): Promise<CatalogRow[]> {
+		return this.#loadCatalogRows('board', [], rows, onUpdate);
 	}
 
-	/** Search across all catalogs. */
-	search(query: string, rows = 8): Promise<CatalogRow[]> {
-		return this.#loadCatalogRows('search', [['search', query]], rows);
+	/** Search across all catalogs (progressive like the board). */
+	search(query: string, rows = 8, onUpdate?: (rows: CatalogRow[]) => void): Promise<CatalogRow[]> {
+		return this.#loadCatalogRows('search', [['search', query]], rows, onUpdate);
 	}
 
-	async #loadCatalogRows(field: 'board' | 'search', extra: [string, string][], rows: number): Promise<CatalogRow[]> {
+	async #loadCatalogRows(field: 'board' | 'search', extra: [string, string][], rows: number, onUpdate?: (rows: CatalogRow[]) => void): Promise<CatalogRow[]> {
 		this.dispatch({ action: 'Load', args: { model: 'CatalogsWithExtra', args: { type: null, extra } } }, field);
 		const initial = await this.waitState<CatalogsWithExtraState>(field, (s) => Array.isArray(s.catalogs));
 		const end = Math.min(rows, initial.catalogs.length);
 		if (end > 0) this.dispatch({ action: 'CatalogsWithExtra', args: { action: 'LoadRange', args: { start: 0, end } } }, field);
-		const state = await this.waitState<CatalogsWithExtraState>(
-			field,
-			(s) => s.catalogs.slice(0, end).every((c) => c.content !== null && c.content.type !== 'Loading'),
-		);
 		const refs = this.catalogs();
-		const out: CatalogRow[] = [];
-		for (const c of state.catalogs.slice(0, end)) {
-			if (!c.content || c.content.type !== 'Ready') continue;
-			const ref = refs.find((r) => r.type === c.type && r.id === c.id && r.addonName === c.addon.manifest.name);
-			out.push({ id: c.id, type: c.type, name: c.name, addonName: c.addon.manifest.name, addonId: c.addon.manifest.id, items: c.content.content, ref });
-		}
-		return out;
+		const collect = (s: CatalogsWithExtraState, final: boolean): CatalogRow[] => {
+			const out: CatalogRow[] = [];
+			for (const c of s.catalogs.slice(0, end)) {
+				const loading = !c.content || c.content.type === 'Loading';
+				if (c.content?.type === 'Err' || (loading && final)) continue;
+				const ref = refs.find((r) => r.type === c.type && r.id === c.id && r.addonName === c.addon.manifest.name);
+				const items = c.content?.type === 'Ready' ? c.content.content : [];
+				if (!loading && items.length === 0) continue;
+				out.push({ id: c.id, type: c.type, name: c.name, addonName: c.addon.manifest.name, addonId: c.addon.manifest.id, items, ref, loading: loading || undefined });
+			}
+			return out;
+		};
+		let lastKey = '';
+		let result: CatalogRow[] = [];
+		const extraKey = JSON.stringify(extra);
+		await this.#follow<CatalogsWithExtraState & { selected?: { extra?: unknown } | null }>(field, {
+			// A newer search replaces this one in the same field.
+			current: (s) => Array.isArray(s.catalogs) && (s.selected?.extra === undefined || JSON.stringify(s.selected.extra) === extraKey),
+			done: (s) => s.catalogs.slice(0, end).every((c) => c.content !== null && c.content.type !== 'Loading'),
+			update: (s, final) => {
+				result = collect(s, final);
+				const key = result.map((r) => `${r.addonId}/${r.type}/${r.id}:${r.loading ? 0 : r.items.length}`).join('|');
+				if (!final && key !== lastKey) { lastKey = key; onUpdate?.(result); }
+			},
+			timeoutMs: SLOW_ADDON_MS,
+		});
+		return result;
 	}
 
 	/** Library items in continue-watching order (empty until something was watched). */
@@ -287,24 +362,51 @@ export class StremioClient {
 	 * Meta item plus the streams every installed addon offers for it (for a
 	 * series, for the episode `videoId`; movies stream under their own id).
 	 */
-	async loadMetaDetails(type: string, id: string, videoId = id): Promise<MetaDetails> {
+	async loadMetaDetails(type: string, id: string, videoId = id, onUpdate?: (details: MetaDetails) => void): Promise<MetaDetails> {
 		const metaPath: ResourcePath = { resource: 'meta', type, id, extra: [] };
 		const streamPath: ResourcePath = { resource: 'stream', type, id: videoId, extra: [] };
 		this.dispatch({ action: 'Load', args: { model: 'MetaDetails', args: { metaPath, streamPath, guessStream: false } } }, 'meta_details');
+		const ours = (s: DetailsState) => !s.selected?.streamPath || s.selected.streamPath.id === videoId;
+		const allAnswered = (s: DetailsState) => s.streams.every((x) => x.content.type !== 'Loading');
+		// Without a listener there is nobody to update later: wait for every add-on (bounded).
 		const state = await this.waitState<DetailsState>(
 			'meta_details',
-			(s) => !!s.metaItem && s.metaItem.content.type !== 'Loading' && s.streams.length > 0 && s.streams.every((x) => x.content.type !== 'Loading'),
+			(s) => ours(s) && !!s.metaItem && s.metaItem.content.type !== 'Loading' && (!!onUpdate || allAnswered(s)),
+			onUpdate ? DEFAULT_TIMEOUT_MS : SLOW_ADDON_MS + DEFAULT_TIMEOUT_MS,
 		);
 		const meta = unwrap(state.metaItem!.content, 'meta');
-		const streams: StreamOption[] = [];
-		for (const entry of state.streams) {
-			if (entry.content.type !== 'Ready') {
-				this.#log(`streams from ${entry.addon.manifest.name}: ${entry.content.type}`);
-				continue;
+		const reported = new Set<string>();
+		const snapshot = (s: DetailsState, final: boolean): MetaDetails => {
+			const streams: StreamOption[] = [];
+			let pending = 0, failed = 0;
+			for (const entry of s.streams) {
+				if (entry.content.type === 'Loading') { if (final) failed++; else pending++; continue; }
+				if (entry.content.type !== 'Ready') {
+					failed++;
+					if (!reported.has(entry.addon.transportUrl)) { reported.add(entry.addon.transportUrl); this.#log(`streams from ${entry.addon.manifest.name}: ${entry.content.type}`); }
+					continue;
+				}
+				for (const stream of entry.content.content) streams.push({ addonName: entry.addon.manifest.name, addonUrl: entry.addon.transportUrl, stream });
 			}
-			for (const stream of entry.content.content) streams.push({ addonName: entry.addon.manifest.name, addonUrl: entry.addon.transportUrl, stream });
+			return { meta, streams, pendingAddons: pending, failedAddons: failed };
+		};
+		const first = snapshot(state, false);
+		if (onUpdate && first.pendingAddons) {
+			let lastCount = first.streams.length, lastPending = first.pendingAddons;
+			void this.#follow<DetailsState>('meta_details', {
+				current: ours,
+				done: allAnswered,
+				update: (s, final) => {
+					const next = snapshot(s, final);
+					if (!final && next.streams.length === lastCount && next.pendingAddons === lastPending) return;
+					lastCount = next.streams.length;
+					lastPending = next.pendingAddons ?? 0;
+					onUpdate(next);
+				},
+				timeoutMs: SLOW_ADDON_MS,
+			});
 		}
-		return { meta, streams };
+		return first;
 	}
 
 	/** Load the Player with a chosen stream; returns the stream the core selected. */

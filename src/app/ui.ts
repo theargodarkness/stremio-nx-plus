@@ -14,10 +14,12 @@ import type { CatalogRef, CatalogRow, MetaDetails, MetaItem, MetaPreview, Stream
 import type { Button } from './input';
 import type { Addon } from '../stremio/addons';
 import { streamKind } from '../stremio/streams';
+import { filterStreams, streamBadges, type FilterResult } from '../stremio/stream-info';
+import { DEFAULT_SETTINGS, SETTING_ITEMS, activeFilterCount, cycleSetting, sanitizeSettings, settingValueLabel, type SettingItem, type Settings } from './settings';
 
-export type Section = 'home' | 'discover' | 'library' | 'search' | 'addons';
-export const SECTIONS: Section[] = ['home', 'discover', 'library', 'search', 'addons'];
-export const SECTION_TITLES: Record<Section, string> = { home: 'Home', discover: 'Discover', library: 'Library', search: 'Search', addons: 'Add-ons' };
+export type Section = 'home' | 'discover' | 'library' | 'search' | 'addons' | 'settings';
+export const SECTIONS: Section[] = ['home', 'discover', 'library', 'search', 'addons', 'settings'];
+export const SECTION_TITLES: Record<Section, string> = { home: 'Home', discover: 'Discover', library: 'Library', search: 'Search', addons: 'Add-ons', settings: 'Settings' };
 
 export type Screen = 'section' | 'details' | 'player';
 
@@ -32,12 +34,38 @@ export interface Row {
 	title: string;
 	kind: 'posters' | 'chips';
 	cards: Card[];
+	/** Stable identity across progressive updates (keeps the cursor on the same row). */
+	key?: string;
+	/** The add-on has not answered yet: drawn as placeholder cards. */
+	loading?: boolean;
 }
 
 export interface ListRow {
 	label: string;
 	detail?: string;
 	enabled: boolean;
+	/** Quality tags drawn as pills before the label (streams only). */
+	badges?: string[];
+	/** Shown only because hidden streams are revealed (X); drawn dimmed. */
+	dimmed?: boolean;
+}
+
+/** A keyboard prompt in progress: the UI draws the text field above the keyboard. */
+export interface KeyboardState {
+	kind: 'search' | 'text';
+	label: string;
+	text: string;
+	cursor: number;
+	/** Height of the keyboard from the bottom of the screen (0 until known). */
+	height: number;
+	placeholder?: string;
+}
+
+export interface SettingRow {
+	label: string;
+	value: string;
+	help: string;
+	kind: SettingItem['kind'];
 }
 
 /** What a tap landed on; the renderer records these with each drawn element. */
@@ -55,6 +83,10 @@ export type HitTarget =
 	| { kind: 'closeTracks' }
 	| { kind: 'addonRow'; index: number }
 	| { kind: 'addonInstall' }
+	| { kind: 'settingRow'; index: number }
+	| { kind: 'settingStep'; index: number; step: 1 | -1 }
+	| { kind: 'toggleHidden' }
+	| { kind: 'searchBar' }
 	| { kind: 'osdSeek'; fraction: number };
 
 export interface TrackOption { id: string; label: string; selected: boolean; enabled: boolean }
@@ -67,19 +99,30 @@ export interface Playback {
 	buffering?: boolean;
 	/** Contiguous data ahead of the decoder, in MiB. */
 	aheadMiB?: number;
+	/** A playback hint for the display (e.g. a 4K source that may stutter). */
+	notice?: string;
 }
 
 /** What the UI needs from the core, the player and the console, without knowing them. */
 export interface UiServices {
 	catalogs(): CatalogRef[];
-	loadBoard(): Promise<CatalogRow[]>;
+	/** `onUpdate` receives rows as add-ons answer; the promise resolves with the final rows. */
+	loadBoard(onUpdate?: (rows: CatalogRow[]) => void): Promise<CatalogRow[]>;
 	continueWatching(): MetaPreview[];
 	loadCatalog(catalog: CatalogRef): Promise<MetaPreview[]>;
 	loadLibrary(): Promise<MetaPreview[]>;
-	search(query: string): Promise<CatalogRow[]>;
-	/** On-screen keyboard; null when dismissed. */
-	promptText(title: string, initial: string): Promise<string | null>;
-	loadDetails(item: MetaPreview, videoId?: string): Promise<MetaDetails>;
+	search(query: string, onUpdate?: (rows: CatalogRow[]) => void): Promise<CatalogRow[]>;
+	/**
+	 * On-screen keyboard; null when dismissed. `ok` labels the OK key (8 chars).
+	 * The console's inline keyboard draws no text field, so `onInput` reports
+	 * the text, caret and keyboard height as they change for the UI to draw.
+	 */
+	promptText(ok: string, initial: string, onInput?: (text: string, cursor: number, keyboardHeight: number) => void): Promise<string | null>;
+	/** Resolves once the meta item is known; streams from slower add-ons follow through `onUpdate`. */
+	loadDetails(item: MetaPreview, videoId?: string, onUpdate?: (details: MetaDetails) => void): Promise<MetaDetails>;
+	/** Persisted settings (defaults when absent, e.g. in host tests). */
+	getSettings?(): Settings;
+	setSettings?(settings: Settings): void;
 	/** Start playing; resolves once playback has begun. `onProgress` updates the footer meanwhile. */
 	play(option: StreamOption, meta: MetaItem, videoId: string, onProgress: (message: string) => void): Promise<void>;
 	stop(): void;
@@ -116,6 +159,11 @@ export interface DetailsState {
 	mode: 'episodes' | 'streams';
 	cursor: number;
 	videoId: string;
+	/** Reveal streams the filters hide (X). */
+	showAll?: boolean;
+	/** Stream add-ons still loading / failed for the current video. */
+	pendingAddons?: number;
+	failedAddons?: number;
 }
 
 export interface OsdState {
@@ -147,8 +195,18 @@ export class UiModel {
 		library: { rows: [], row: 0, col: 0, loaded: false },
 		search: { rows: [], row: 0, col: 0, loaded: false },
 		addons: { rows: [], row: 0, col: 0, loaded: false },
+		settings: { rows: [], row: 0, col: 0, loaded: true },
 	};
 	details?: DetailsState;
+	settingsCursor = 0;
+	/** A search is waiting for add-ons (the body says so instead of "Press Y"). */
+	searching = false;
+	/** Open keyboard prompt; all pad and touch input belongs to the keyboard meanwhile. */
+	keyboard?: KeyboardState;
+	/** Pause after the last keystroke before searching as you type. */
+	static searchDebounceMs = 600;
+	/** Set after the first A on "Reset to defaults"; the second A resets. */
+	resetConfirm = false;
 	osd: OsdState = { visible: false, hideAt: 0, scrubPresses: 0, lastScrubAt: 0 };
 	/** Footer text while something loads, or after an error. */
 	message = '';
@@ -163,11 +221,37 @@ export class UiModel {
 	#services: UiServices;
 	#now: () => number;
 	#trackOperation = 0;
+	#settings: Settings;
+	#settingsVersion = 0;
+	/** Generation counters: a newer load makes older progressive updates stale. */
+	#boardToken = 0;
+	#searchToken = 0;
+	#detailsToken = 0;
+	#liveTimer?: ReturnType<typeof setTimeout>;
+	/** Query of the latest search started (live or final). */
+	#lastQuery = '';
+	/** Streams that arrived before the details screen they belong to was set up. */
+	#lateStreams?: { token: number; videoId: string; details: MetaDetails };
+	#streamView?: { streams: StreamOption[]; version: number; showAll: boolean; result: FilterResult };
+	#listRows?: { source: object; rows: ListRow[] };
 
 	constructor(services: UiServices, now: () => number = () => performance.now()) {
 		this.#services = services;
 		this.#now = now;
+		this.#settings = sanitizeSettings(services.getSettings?.() ?? DEFAULT_SETTINGS);
 		void this.#enterSection('home');
+	}
+
+	settings(): Settings {
+		return this.#settings;
+	}
+
+	updateSettings(next: Settings): void {
+		this.#settings = sanitizeSettings(next);
+		this.#settingsVersion++;
+		this.#services.setSettings?.(this.#settings);
+		if (this.details) this.details.cursor = Math.max(0, Math.min(this.details.cursor, this.listRows().length - 1));
+		this.#touch();
 	}
 
 	// ---- queries for the renderer ----
@@ -181,7 +265,6 @@ export class UiModel {
 			case 'section': {
 				const s = this.current();
 				if (this.section === 'discover' && s.catalog) return `${s.catalog.name} · ${s.catalog.addonName}`;
-				if (this.section === 'search' && s.query) return `Search: ${s.query}`;
 				return SECTION_TITLES[this.section];
 			}
 			case 'details':
@@ -194,24 +277,68 @@ export class UiModel {
 		switch (this.screen) {
 			case 'player':
 				return 'A pause   ◀ ▶ scrub   Y audio/subtitles   B back';
-			case 'details':
-				return 'A select   B back';
+			case 'details': {
+				const d = this.details;
+				if (d?.mode !== 'streams') return 'A select   B back';
+				const view = this.streamView();
+				if (d.showAll) return `A play   X hide filtered streams   B back`;
+				return view.hidden > 0 ? `A play   X show ${view.hidden} hidden   B back` : 'A play   B back';
+			}
 			default:
+				if (this.keyboard) return '';
+				if (this.section === 'search') return this.railFocused ? 'A select   L/R sections' : 'Y new search   A open   B rail   L/R sections';
+				if (this.section === 'settings') return this.resetConfirm ? 'A confirm reset   B cancel' : '◀ ▶ change   A select   B rail   L/R sections';
 				if (this.section === 'addons') return this.addonConfirm ? 'A confirm removal   B cancel' : 'Y install link   A remove selected   L/R sections';
-				return this.section === 'search' ? 'Y new search   A open   B rail   + exit' : 'A open   L/R sections   + exit';
+				return 'A open   Y search   L/R sections   + exit';
 		}
 	}
 
-	/** The vertical list on the details screen (episodes or streams). */
+	/** The filtered, sorted streams of the details screen (memoized per stream list, settings and X state). */
+	streamView(): FilterResult {
+		const d = this.details;
+		if (!d) return { rows: [], shown: 0, hidden: 0 };
+		const showAll = !!d.showAll;
+		const cached = this.#streamView;
+		if (cached && cached.streams === d.streams && cached.version === this.#settingsVersion && cached.showAll === showAll) return cached.result;
+		const result = filterStreams(d.streams, this.#settings, showAll);
+		this.#streamView = { streams: d.streams, version: this.#settingsVersion, showAll, result };
+		return result;
+	}
+
+	/** One-line status above the stream list: counts, hidden streams, slow add-ons. */
+	streamsHeader(): string {
+		const d = this.details;
+		if (!d || d.mode !== 'streams') return '';
+		const view = this.streamView();
+		const parts = [`${view.shown} stream${view.shown === 1 ? '' : 's'}`];
+		if (view.hidden > 0) parts.push(d.showAll ? `${view.hidden} filtered (dimmed)` : `${view.hidden} hidden by ${activeFilterCount(this.#settings) === 1 ? 'a filter' : 'filters'}`);
+		if (d.pendingAddons) parts.push(`waiting for ${d.pendingAddons} add-on${d.pendingAddons === 1 ? '' : 's'}…`);
+		else if (d.failedAddons) parts.push(`${d.failedAddons} add-on${d.failedAddons === 1 ? '' : 's'} unavailable`);
+		return parts.join('  ·  ');
+	}
+
+	/** The vertical list on the details screen (episodes or streams); memoized, it is read on every redraw and press. */
 	listRows(): ListRow[] {
 		const d = this.details;
 		if (!d) return [];
-		if (d.mode === 'episodes') return d.videos.map((v) => ({ label: videoLabel(v), detail: v.released?.slice(0, 10), enabled: true }));
-		return d.streams.map((s) => ({
-			label: `${s.stream.name ?? s.addonName}: ${(s.stream.title ?? s.stream.description ?? '').replace(/\s+/g, ' ')}`.slice(0, 90),
-			detail: `${{ torrent: 'torrent', url: 'HTTP video', external: 'open on phone', unsupported: 'unsupported source' }[streamKind(s.stream)]} · ${s.addonName}`,
-			enabled: streamKind(s.stream) !== 'unsupported',
-		}));
+		const source: object = d.mode === 'episodes' ? d.videos : this.streamView();
+		if (this.#listRows?.source === source) return this.#listRows.rows;
+		const rows: ListRow[] = d.mode === 'episodes'
+			? d.videos.map((v) => ({ label: videoLabel(v), detail: v.released?.slice(0, 10), enabled: true }))
+			: this.streamView().rows.map(({ option, info, hiddenBy }) => ({
+				label: (info.text || `${option.stream.name ?? option.addonName}`.replace(/\s+/g, ' ')).slice(0, 160),
+				detail: hiddenBy ? `Hidden: ${hiddenBy}` : `${{ torrent: 'torrent', url: 'HTTP video', external: 'open on phone', unsupported: 'unsupported source' }[info.kind]} · ${option.addonName}`,
+				enabled: info.kind !== 'unsupported',
+				badges: streamBadges(info),
+				dimmed: !!hiddenBy,
+			}));
+		this.#listRows = { source, rows };
+		return rows;
+	}
+
+	/** Settings rows for the renderer. */
+	settingRows(): SettingRow[] {
+		return SETTING_ITEMS.map((item) => ({ label: item.label, value: settingValueLabel(item, this.#settings), help: item.help, kind: item.kind }));
 	}
 
 	focusedCard(): Card | undefined {
@@ -223,6 +350,7 @@ export class UiModel {
 
 	/** One button press. Async work runs in the background; `busy` gates input meanwhile. */
 	press(button: Button): void {
+		if (this.keyboard) return; // the keyboard has the controls
 		if (this.busy) {
 			if (button === 'b') this.#services.stop(); // abandon a pending load/connect
 			return;
@@ -239,6 +367,8 @@ export class UiModel {
 
 	/** Touch: something drawn was tapped. */
 	tap(target: HitTarget): void {
+		if (this.keyboard) return;
+		if (target.kind === 'searchBar') { this.railFocused = false; void this.openSearch(); return; }
 		if (this.busy) return;
 		if (this.mediaMenu && !['tracks', 'trackRow', 'subtitleDelay', 'closeTracks'].includes(target.kind)) return;
 		switch (target.kind) {
@@ -250,6 +380,9 @@ export class UiModel {
 			case 'subtitleDelay': this.#services.subtitleDelay(target.delta); return this.#touch();
 			case 'addonRow': this.addonCursor = target.index; void this.#activateAddon(); return;
 			case 'addonInstall': void this.#installAddon(); return;
+			case 'settingRow': this.settingsCursor = target.index; this.railFocused = false; void this.#activateSetting(); return;
+			case 'settingStep': this.settingsCursor = target.index; this.railFocused = false; return this.#stepSetting(target.step);
+			case 'toggleHidden': return this.#toggleHidden();
 			case 'rail':
 				void this.#enterSection(target.section);
 				return;
@@ -288,7 +421,7 @@ export class UiModel {
 
 	/** Touch: a horizontal or vertical swipe on the section screen, in card steps. */
 	swipe(dxSteps: number, dySteps: number): void {
-		if (this.busy || this.screen !== 'section') return;
+		if (this.keyboard || this.busy || this.screen !== 'section') return;
 		const s = this.current();
 		if (dySteps !== 0) this.#moveRow(s, dySteps);
 		if (dxSteps !== 0) this.#moveCol(s, dxSteps);
@@ -350,6 +483,8 @@ export class UiModel {
 	addonSetup(): { url: string; code: string } { return this.#services.addonSetup(); }
 	addonsChanged(): void {
 		for (const section of ['home', 'discover', 'search'] as const) this.sections[section].loaded = false;
+		this.#boardToken++;
+		this.#searchToken++;
 		this.addonCursor = Math.max(0, Math.min(this.addonCursor, this.addons().length - 1));
 		this.addonConfirm = undefined;
 		this.#touch();
@@ -382,7 +517,7 @@ export class UiModel {
 
 	async #installAddon(): Promise<void> {
 		await this.#run('Enter the add-on install link…', async () => {
-			const url = await this.#services.promptText('Install', 'https://');
+			const url = await this.#prompt({ kind: 'text', label: 'Add-on install link', ok: 'Install', initial: 'https://' });
 			if (!url?.trim()) return;
 			this.progress('Installing add-on…');
 			await this.#services.installAddon(url);
@@ -419,6 +554,7 @@ export class UiModel {
 			return;
 		}
 		if (this.railFocused) return this.#pressInRail(button);
+		if (this.section === 'settings') return this.#pressInSettings(button);
 		if (this.section === 'addons') {
 			if (button === 'y') { void this.#installAddon(); return; }
 			if (button === 'a') { void this.#activateAddon(); return; }
@@ -445,7 +581,9 @@ export class UiModel {
 			case 'a':
 				return void this.#activateCard();
 			case 'y':
-				if (this.section === 'search') void this.#promptSearch();
+				// Y searches from any browsing section.
+				if (this.section !== 'search') void this.#enterSection('search', false);
+				void this.openSearch();
 				return;
 			case 'b':
 				if (this.section !== 'home') {
@@ -455,6 +593,82 @@ export class UiModel {
 				}
 				return;
 		}
+	}
+
+	#pressInSettings(button: Button): void {
+		switch (button) {
+			case 'up':
+			case 'down':
+				this.settingsCursor = Math.max(0, Math.min(SETTING_ITEMS.length - 1, this.settingsCursor + (button === 'up' ? -1 : 1)));
+				this.resetConfirm = false;
+				this.message = '';
+				return this.#touch();
+			case 'left':
+			case 'right':
+				return this.#stepSetting(button === 'left' ? -1 : 1);
+			case 'a':
+				return void this.#activateSetting();
+			case 'b':
+				if (this.resetConfirm) { this.resetConfirm = false; this.message = ''; return this.#touch(); }
+				this.railFocused = true;
+				this.railIndex = SECTIONS.indexOf(this.section);
+				return this.#touch();
+		}
+	}
+
+	#stepSetting(step: 1 | -1): void {
+		const item = SETTING_ITEMS[this.settingsCursor];
+		if (item?.kind !== 'choice') return;
+		this.resetConfirm = false;
+		this.message = '';
+		this.updateSettings(cycleSetting(item, this.#settings, step));
+	}
+
+	async #activateSetting(): Promise<void> {
+		const item = SETTING_ITEMS[this.settingsCursor];
+		if (!item) return;
+		if (item.kind === 'choice') return this.#stepSetting(1);
+		if (item.kind === 'text') {
+			const value = await this.#prompt({ kind: 'text', label: item.label, ok: 'Save', initial: this.#settings[item.key], placeholder: 'e.g. 3D, HDTS' });
+			if (value === null) return;
+			this.updateSettings({ ...this.#settings, [item.key]: value });
+			this.message = value.trim() ? 'Excluded words saved.' : 'Excluded words cleared.';
+			return this.#touch();
+		}
+		if (!this.resetConfirm) {
+			this.resetConfirm = true;
+			this.message = 'Reset every setting to the defaults? A confirms · B cancels';
+			return this.#touch();
+		}
+		this.resetConfirm = false;
+		this.updateSettings({ ...DEFAULT_SETTINGS });
+		this.message = 'Settings reset to defaults.';
+		this.#touch();
+	}
+
+	#toggleHidden(): void {
+		const d = this.details;
+		if (!d || d.mode !== 'streams' || this.screen !== 'details') return;
+		const rows = this.streamView().rows;
+		const focused = rows[d.cursor]?.option;
+		d.showAll = !d.showAll;
+		const next = this.streamView().rows;
+		const i = focused ? next.findIndex((r) => r.option === focused) : -1;
+		d.cursor = i >= 0 ? i : Math.max(0, Math.min(d.cursor, next.length - 1));
+		this.#touch();
+	}
+
+	/** Replace a section's rows, keeping the cursor on the same row and card when they still exist. */
+	#setRows(s: SectionState, rows: Row[]): void {
+		const focusRow = s.rows[s.row];
+		const focusCard = focusRow?.cards[s.col]?.meta.id;
+		s.rows = rows;
+		const r = focusRow?.key ? rows.findIndex((x) => x.key === focusRow.key) : -1;
+		s.row = r >= 0 ? r : Math.max(0, Math.min(s.row, rows.length - 1));
+		const cards = rows[s.row]?.cards ?? [];
+		const c = r >= 0 && focusCard !== undefined ? cards.findIndex((x) => x.meta.id === focusCard) : -1;
+		s.col = c >= 0 ? c : Math.max(0, Math.min(s.col, cards.length - 1));
+		this.#touch();
 	}
 
 	#pressInRail(button: Button): void {
@@ -499,25 +713,43 @@ export class UiModel {
 	/** Discover: highlight a catalog chip; its grid loads when it is activated. */
 	#selectChip(_s: SectionState, _col: number): void {}
 
-	async #enterSection(section: Section): Promise<void> {
+	async #enterSection(section: Section, openKeyboard = true): Promise<void> {
 		this.section = section;
 		this.screen = 'section';
 		this.railFocused = false;
 		this.message = '';
 		this.addonConfirm = undefined;
+		this.resetConfirm = false;
 		this.#touch();
 		const s = this.sections[section];
 		if (s.loaded) return;
 		switch (section) {
-			case 'addons': return;
-			case 'home':
-				return this.#run('Loading…', async () => {
-					const rows = await this.#services.loadBoard();
-					s.rows = boardRows(this.#services.continueWatching(), rows);
-					s.loaded = true;
-					s.row = 0;
-					s.col = 0;
-				});
+			case 'addons':
+			case 'settings':
+				return;
+			case 'home': {
+				// Rows appear as each add-on answers; a slow or failing add-on no longer blocks the board.
+				const token = ++this.#boardToken;
+				const loading = 'Loading catalogs…';
+				s.loaded = true;
+				this.message = loading;
+				this.#touch();
+				const apply = (rows: CatalogRow[]) => {
+					if (token !== this.#boardToken) return;
+					this.#setRows(s, boardRows(this.#services.continueWatching(), rows));
+				};
+				try {
+					apply(await this.#services.loadBoard(apply));
+					if (token === this.#boardToken && this.message === loading) this.message = s.rows.length ? '' : 'No catalogs loaded. Check the connection or your add-ons.';
+				} catch (err) {
+					if (token !== this.#boardToken) return;
+					s.loaded = false;
+					this.message = `Failed: ${err instanceof Error ? err.message : String(err)}`;
+					this.#services.log(this.message);
+				}
+				this.#touch();
+				return;
+			}
 			case 'discover': {
 				s.rows = [{ title: 'Catalogs', kind: 'chips', cards: this.#services.catalogs().map((c) => ({ meta: { id: `${c.addonUrl}|${c.type}|${c.id}`, type: c.type, name: c.name }, label: `${c.name} · ${c.type}`, seeAll: c })) }];
 				s.loaded = true;
@@ -536,7 +768,8 @@ export class UiModel {
 					if (items.length === 0) this.message = 'Your library is empty. Watched titles show up here.';
 				});
 			case 'search':
-				return this.#promptSearch();
+				if (openKeyboard) return this.openSearch();
+				return;
 		}
 	}
 
@@ -560,26 +793,120 @@ export class UiModel {
 		});
 	}
 
-	async #promptSearch(): Promise<void> {
-		const s = this.sections.search;
-		const query = await this.#services.promptText('Search', s.query ?? '');
-		if (query === null || query.trim() === '') {
-			if (!s.loaded) {
-				s.loaded = true;
-				this.message = 'Press Y to search.';
+	/**
+	 * A keyboard prompt with the text field drawn by the UI (the console's
+	 * inline keyboard has none). Input is modal while it is open.
+	 */
+	async #prompt(opts: { kind: KeyboardState['kind']; label: string; ok: string; initial: string; placeholder?: string; onText?: (text: string) => void }): Promise<string | null> {
+		if (this.keyboard) return null;
+		const k: KeyboardState = { kind: opts.kind, label: opts.label, text: opts.initial, cursor: opts.initial.length, height: 0, placeholder: opts.placeholder };
+		this.keyboard = k;
+		this.#touch();
+		try {
+			return await this.#services.promptText(opts.ok, opts.initial, (text, cursor, height) => {
+				if (this.keyboard !== k) return;
+				const changed = text !== k.text;
+				k.text = text;
+				k.cursor = Math.max(0, Math.min(cursor, text.length));
+				if (height > 0) k.height = height;
 				this.#touch();
-			}
+				if (changed) opts.onText?.(text);
+			});
+		} finally {
+			if (this.keyboard === k) this.keyboard = undefined;
+			this.#touch();
+		}
+	}
+
+	/**
+	 * Search: an empty field every time, results as you type (after a short
+	 * pause), OK keeps the results and focuses them, B restores what was
+	 * there before.
+	 */
+	async openSearch(): Promise<void> {
+		if (this.keyboard || this.busy) return;
+		const s = this.sections.search;
+		const before = { query: s.query, rows: s.rows, row: s.row, col: s.col, lastQuery: this.#lastQuery, message: this.message };
+		const value = await this.#prompt({
+			kind: 'search', label: 'Search', ok: 'Search', initial: '', placeholder: 'Movies, series, channels…',
+			onText: (text) => {
+				clearTimeout(this.#liveTimer);
+				const q = text.trim();
+				if (q.length < 2 || q === this.#lastQuery) return;
+				this.#liveTimer = setTimeout(() => void this.#runSearch(q), UiModel.searchDebounceMs);
+			},
+		});
+		clearTimeout(this.#liveTimer);
+		const q = value?.trim() ?? '';
+		if (!q) {
+			// Dismissed: back to the previous results (a live search may have replaced them).
+			this.#searchToken++;
+			this.searching = false;
+			Object.assign(s, { query: before.query, rows: before.rows, row: before.row, col: before.col, loaded: true });
+			this.#lastQuery = before.lastQuery;
+			this.message = before.message;
+			this.#touch();
 			return;
 		}
-		await this.#run(`Searching “${query.trim()}”…`, async () => {
-			const rows = await this.#services.search(query.trim());
-			s.query = query.trim();
-			s.rows = rows.map((r) => ({ title: `${r.name} · ${r.type}`, kind: 'posters' as const, cards: r.items.map(cardOf) }));
-			s.loaded = true;
+		this.railFocused = false;
+		if (q === this.#lastQuery) {
+			// The search typed so far is already running or done: keep it, focus the first result.
 			s.row = 0;
 			s.col = 0;
-			if (rows.length === 0) this.message = 'No results.';
-		});
+			this.message = this.searching ? `Searching “${q}”…` : s.rows.length === 0 ? `No results for “${q}”.` : '';
+			this.#touch();
+			return;
+		}
+		await this.#runSearch(q);
+	}
+
+	async #runSearch(q: string): Promise<void> {
+		const s = this.sections.search;
+		const token = ++this.#searchToken;
+		const searching = `Searching “${q}”…`;
+		this.#lastQuery = q;
+		s.query = q;
+		s.loaded = true;
+		this.searching = true;
+		if (!this.keyboard) {
+			// A final search starts clean; while typing, the previous matches stay until new ones arrive.
+			s.rows = [];
+			s.row = 0;
+			s.col = 0;
+			this.message = searching;
+		}
+		this.#touch();
+		const apply = (rows: CatalogRow[]) => {
+			if (token !== this.#searchToken) return;
+			this.#setRows(s, rows.map((r) => ({ title: `${r.name} · ${r.type}`, kind: 'posters' as const, cards: r.items.map(cardOf), key: rowKey(r), loading: r.loading })));
+		};
+		try {
+			const rows = await this.#services.search(q, apply);
+			apply(rows);
+			if (token === this.#searchToken) this.message = this.keyboard ? '' : rows.length === 0 ? `No results for “${q}”.` : this.message === searching ? '' : this.message;
+		} catch (err) {
+			if (token !== this.#searchToken) return;
+			this.message = `Failed: ${err instanceof Error ? err.message : String(err)}`;
+			this.#services.log(this.message);
+		} finally {
+			if (token === this.#searchToken) this.searching = false;
+		}
+		this.#touch();
+	}
+
+	/** Distinct titles from the current search rows, for the list above the keyboard. */
+	searchMatches(limit: number): MetaPreview[] {
+		const seen = new Set<string>();
+		const out: MetaPreview[] = [];
+		for (const row of this.sections.search.rows) {
+			for (const card of row.cards) {
+				if (card.seeAll || seen.has(card.meta.id)) continue;
+				seen.add(card.meta.id);
+				out.push(card.meta);
+				if (out.length >= limit) return out;
+			}
+		}
+		return out;
 	}
 
 	async #activateCard(): Promise<void> {
@@ -590,12 +917,40 @@ export class UiModel {
 	}
 
 	async #openDetails(item: MetaPreview): Promise<void> {
+		const token = ++this.#detailsToken;
 		await this.#run(`Loading ${item.name}…`, async () => {
-			const details = await this.#services.loadDetails(item);
+			const details = await this.#services.loadDetails(item, undefined, (next) => this.#streamsArrived(token, item.id, next));
+			if (token !== this.#detailsToken) return;
 			const videos = details.meta.videos ?? [];
-			this.details = { meta: details.meta, streams: details.streams, videos, mode: videos.length > 0 ? 'episodes' : 'streams', cursor: 0, videoId: item.id };
+			this.details = { meta: details.meta, streams: details.streams, videos, mode: videos.length > 0 ? 'episodes' : 'streams', cursor: 0, videoId: item.id,
+				pendingAddons: details.pendingAddons ?? 0, failedAddons: details.failedAddons ?? 0 };
 			this.screen = 'details';
+			this.#applyLateStreams(token);
 		});
+	}
+
+	/** Progressive stream results; keeps the cursor on the stream it was on. */
+	#streamsArrived(token: number, videoId: string, next: MetaDetails): void {
+		if (token !== this.#detailsToken) return;
+		const d = this.details;
+		if (!d || d.videoId !== videoId) { this.#lateStreams = { token, videoId, details: next }; return; }
+		const focused = d.mode === 'streams' ? this.streamView().rows[d.cursor]?.option : undefined;
+		d.streams = next.streams;
+		d.pendingAddons = next.pendingAddons ?? 0;
+		d.failedAddons = next.failedAddons ?? 0;
+		if (d.mode === 'streams') {
+			const rows = this.streamView().rows;
+			const key = focused && streamKey(focused);
+			const i = key ? rows.findIndex((r) => streamKey(r.option) === key) : -1;
+			d.cursor = i >= 0 ? i : Math.max(0, Math.min(d.cursor, rows.length - 1));
+		}
+		this.#touch();
+	}
+
+	#applyLateStreams(token: number): void {
+		const late = this.#lateStreams;
+		this.#lateStreams = undefined;
+		if (late && late.token === token) this.#streamsArrived(token, late.videoId, late.details);
 	}
 
 	// ---- details screen ----
@@ -613,6 +968,8 @@ export class UiModel {
 			}
 			case 'a':
 				return void this.#activateListRow();
+			case 'x':
+				return this.#toggleHidden();
 			case 'b':
 				if (d.mode === 'streams' && d.videos.length > 0) {
 					d.mode = 'episodes';
@@ -631,16 +988,22 @@ export class UiModel {
 		if (d.mode === 'episodes') {
 			const video = d.videos[d.cursor];
 			if (!video) return;
+			const token = ++this.#detailsToken;
 			await this.#run(`Loading ${videoLabel(video)}…`, async () => {
-				const details = await this.#services.loadDetails(d.meta, video.id);
+				const details = await this.#services.loadDetails(d.meta, video.id, (next) => this.#streamsArrived(token, video.id, next));
+				if (token !== this.#detailsToken || this.details !== d) return;
 				d.streams = details.streams;
 				d.videoId = video.id;
 				d.mode = 'streams';
 				d.cursor = 0;
+				d.showAll = false;
+				d.pendingAddons = details.pendingAddons ?? 0;
+				d.failedAddons = details.failedAddons ?? 0;
+				this.#applyLateStreams(token);
 			});
 			return;
 		}
-		const option = d.streams[d.cursor];
+		const option = this.streamView().rows[d.cursor]?.option;
 		if (!option || streamKind(option.stream) === 'unsupported') return;
 		if (streamKind(option.stream) === 'external') {
 			await this.#run('Preparing service link…', async () => { this.message = await this.#services.openExternal(option.stream.externalUrl!); });
@@ -732,14 +1095,24 @@ function cardOf(meta: MetaPreview): Card {
 	return { meta, label: meta.name };
 }
 
+function rowKey(c: CatalogRow): string {
+	return `${c.addonId}/${c.type}/${c.id}`;
+}
+
+/** Identity of a stream across core state updates (the core re-serializes objects). */
+function streamKey(o: StreamOption): string {
+	const s = o.stream;
+	return `${o.addonUrl}|${s.infoHash ?? ''}|${s.fileIdx ?? ''}|${s.url ?? s.externalUrl ?? ''}|${s.name ?? ''}|${s.title ?? s.description ?? ''}`;
+}
+
 /** Board rows: continue watching first (when there is any), then every catalog with a "See all" card. */
 export function boardRows(continueWatching: MetaPreview[], catalogs: CatalogRow[]): Row[] {
 	const rows: Row[] = [];
-	if (continueWatching.length > 0) rows.push({ title: 'Continue watching', kind: 'posters', cards: continueWatching.map(cardOf) });
+	if (continueWatching.length > 0) rows.push({ title: 'Continue watching', kind: 'posters', cards: continueWatching.map(cardOf), key: 'continue-watching' });
 	for (const c of catalogs) {
 		const cards = c.items.map(cardOf);
-		if (c.ref) cards.push({ meta: { id: SEE_ALL_ID, type: c.type, name: 'See all' }, label: 'See all', seeAll: c.ref });
-		rows.push({ title: `${c.name} · ${c.type}`, kind: 'posters', cards });
+		if (c.ref && !c.loading) cards.push({ meta: { id: SEE_ALL_ID, type: c.type, name: 'See all' }, label: 'See all', seeAll: c.ref });
+		rows.push({ title: `${c.name} · ${c.type}`, kind: 'posters', cards, key: rowKey(c), loading: c.loading });
 	}
 	return rows;
 }

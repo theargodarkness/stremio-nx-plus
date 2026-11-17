@@ -20,6 +20,10 @@ import { TorrentSessions } from './sessions';
 import { attachTouch } from './touch';
 import { UiModel, type UiServices } from './ui';
 import { drawOsd, drawSubtitles, drawUi, hitTest, type HitRect } from './ui-draw';
+import { loadSettings, saveSettings, type Settings } from './settings';
+import { promptKeyboard, type KeyboardLike } from './keyboard';
+
+const BUILD = 'stremio-nx build 0.3.0-search-decode-20261116';
 
 const CONTROL_PORT = 11470;
 const ADDON_PORT = 11471;
@@ -53,13 +57,18 @@ let consoleHidden = false;
 let logDirty = false;
 let logFlushing = false;
 let logTimer: ReturnType<typeof setTimeout> | undefined;
+/** Verbose per-second stats (Settings > Diagnostics logging). Every flush rewrites the whole file. */
+let diagnosticsLogging = false;
 /** `lazy` lines (per-second stats) reach the SD card within LOG_FLUSH_MS; events and errors immediately. */
 function log(msg: string, lazy = false): void {
+	if (lazy && !diagnosticsLogging) return;
 	const start = performance.now();
 	if (!consoleHidden) console.log(msg);
 	logLines.push(msg);
-	// Retain the launch header and the latest diagnostics, bounded for long sessions.
-	if (logLines.length > 2048) logLines.splice(1, logLines.length - 2048);
+	// Retain the launch header and the latest diagnostics, bounded for long sessions:
+	// the whole buffer is rewritten on each flush, so keep it small unless diagnosing.
+	const limit = diagnosticsLogging ? 2048 : 400;
+	if (logLines.length > limit) logLines.splice(1, logLines.length - limit);
 	logDirty = true;
 	if (!lazy) void flushLog();
 	else if (!logTimer) logTimer = setTimeout(() => { logTimer = undefined; void flushLog(); }, LOG_FLUSH_MS);
@@ -86,43 +95,9 @@ function pickStorage(): KeyValueStore {
 	return new MemoryStore();
 }
 
-/** The console's software keyboard as a promise; null when dismissed. */
-function promptText(title: string, initial: string, onOpen: (open: boolean) => void): Promise<string | null> {
-	return new Promise((resolve) => {
-		const kb = navigator.virtualKeyboard as unknown as {
-			value: string;
-			okButtonText?: string;
-			boundingRect: { height: number };
-			show(): void;
-			addEventListener(type: string, cb: () => void): void;
-			removeEventListener(type: string, cb: () => void): void;
-		};
-		let settled = false;
-		const finish = (value: string | null) => {
-			if (settled) return;
-			settled = true;
-			kb.removeEventListener('submit', onSubmit);
-			kb.removeEventListener('geometrychange', onGeometry);
-			onOpen(false);
-			resolve(value);
-		};
-		const onSubmit = () => finish(kb.value);
-		const onGeometry = () => {
-			if (kb.boundingRect.height === 0) finish(null);
-		};
-		kb.addEventListener('submit', onSubmit);
-		kb.okButtonText = title;
-		kb.value = initial;
-		onOpen(true);
-		try {
-			kb.show(); // dispatches its own geometry event synchronously
-			log(`keyboard shown: ${JSON.stringify(kb.boundingRect)}`);
-			kb.addEventListener('geometrychange', onGeometry); // a zero rect from here on = dismissed
-		} catch (err) {
-			log(`keyboard failed: ${err instanceof Error ? err.message : String(err)}`);
-			finish(null);
-		}
-	});
+/** The console's software keyboard as a promise; null when dismissed (see keyboard.ts). */
+function promptText(title: string, initial: string, onOpen: (open: boolean) => void, onInput?: (text: string, cursor: number, height: number) => void): Promise<string | null> {
+	return promptKeyboard(navigator.virtualKeyboard as unknown as KeyboardLike, title, initial, onOpen, log, onInput);
 }
 
 interface AppState {
@@ -163,15 +138,17 @@ function startPresenting(state: AppState): void {
 	let drawnVersion = -1;
 	let drawnFrames = -1;
 	let drawnOsdVersion = -1;
-	let drawnSubtitle = '';
 	let lastRender = performance.now();
+	let keyboardWasOpen = false;
 
 	attachTouch(screen, {
 		onTap: (x, y) => {
+			// Taps on the keyboard's keys must not reach the screen behind it.
+			if (state.keyboardOpen || state.ui?.keyboard) return;
 			const target = hitTest(hits, x, y);
 			if (target) state.ui?.tap(target);
 		},
-		onSwipe: (dx, dy) => state.ui?.swipe(dx, dy),
+		onSwipe: (dx, dy) => { if (!state.keyboardOpen) state.ui?.swipe(dx, dy); },
 	});
 
 	const render = () => {
@@ -184,6 +161,12 @@ function startPresenting(state: AppState): void {
 		}
 		lastRender = now;
 		const { ui, player } = state;
+		if (state.keyboardOpen) keyboardWasOpen = true;
+		else if (keyboardWasOpen) {
+			// The button that closed the keyboard is still down; it must not act on the screen.
+			keyboardWasOpen = false;
+			input.sync(now);
+		}
 		if (ui && !state.keyboardOpen) {
 			input.poll(now);
 			for (const b of BUTTONS) {
@@ -198,26 +181,32 @@ function startPresenting(state: AppState): void {
 		if (ui && video && video.videoWidth > 0) {
 			drawnVersion = -1; // force a UI redraw when we come back
 			const frames = video.getVideoPlaybackQuality().totalVideoFrames;
-			const subtitle = player?.subtitleText() ?? '';
 			// Redraw on a new frame or on any model change (pause, scrub, display
-			// shown/hidden); the bar advances with the frames themselves.
+			// shown/hidden); the bar advances with the frames themselves. Subtitle
+			// text is looked up per presented frame, not per display refresh.
 			const osdChanged = ui.version !== drawnOsdVersion;
-			if (frames !== drawnFrames || osdChanged || subtitle !== drawnSubtitle) {
+			if (frames !== drawnFrames || osdChanged) {
+				const subtitle = player?.subtitleText() ?? '';
 				drawnFrames = frames;
-				drawnSubtitle = subtitle;
 				drawnOsdVersion = ui.version;
-				// Clear controls from the letterbox borders as well as the video.
-				ctx.fillStyle = '#000';
-				ctx.fillRect(0, 0, screen.width, screen.height);
 				const scale = Math.min(screen.width / video.videoWidth, screen.height / video.videoHeight);
 				const w = Math.round(video.videoWidth * scale);
 				const h = Math.round(video.videoHeight * scale);
+				const x = (screen.width - w) >> 1;
+				const y = (screen.height - h) >> 1;
+				// Clear only the letterbox bars (controls may have been drawn there);
+				// the opaque video covers the rest.
+				ctx.fillStyle = '#000';
+				if (y > 0) { ctx.fillRect(0, 0, screen.width, y); ctx.fillRect(0, y + h, screen.width, screen.height - y - h); }
+				if (x > 0) { ctx.fillRect(0, 0, x, screen.height); ctx.fillRect(x + w, 0, screen.width - x - w, screen.height); }
 				const drawStart = performance.now();
-				if (state.diag === 0) ctx.drawImage(video, (screen.width - w) >> 1, (screen.height - h) >> 1, w, h);
+				if (state.diag === 0) ctx.drawImage(video, x, y, w, h);
+				else ctx.fillRect(x, y, w, h);
 				probes.drawMaxMs = Math.max(probes.drawMaxMs, performance.now() - drawStart);
 				hits = [];
 				if (state.diag === 0) drawSubtitles(ctx, subtitle, ui.osd.visible);
-				if (state.diag < 2) drawOsd(ctx, ui, player?.playback() ?? null, hits);
+				// Playback state (several native queries) only when the controls show it.
+				if (state.diag < 2) drawOsd(ctx, ui, ui.osd.visible ? player?.playback() ?? null : null, hits);
 				if (state.showStats) {
 					ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
 					ctx.fillRect(0, 0, screen.width, 28);
@@ -253,7 +242,7 @@ async function main(): Promise<void> {
 	}
 	await Switch.mkdir(LOG_DIR).catch(() => undefined);
 	Switch.setMediaPlaybackState(true); // keep the screen awake
-	log(`stremio-nx build streaming-opt-20260926 | device ip ${Switch.networkInfo().ip} | canvas ${screen.width}x${screen.height}`);
+	log(`${BUILD} | device ip ${Switch.networkInfo().ip} | canvas ${screen.width}x${screen.height}`);
 
 	const state: AppState = { keyboardOpen: false, showStats: false, diag: 0 };
 	startPresenting(state);
@@ -270,8 +259,13 @@ async function main(): Promise<void> {
 	nxPlatform.listen(CONTROL_PORT, (conn) => void serveConnection(conn, handler), '127.0.0.1');
 	log(`control server on ${CONTROL_BASE}`);
 
-	// 2. stremio-core, pointed (by its default profile) at that server.
-	installShims({ appVersion: '0.1.0', shellVersion: 'stremio-nx', storage: pickStorage() });
+	// 2. stremio-core, pointed (by its default profile) at that server. Storage
+	// (and with it the user profile) is first touched here, after presenting began.
+	const storage = pickStorage();
+	let settings: Settings = loadSettings(storage);
+	diagnosticsLogging = settings.diagnostics;
+	log(`settings: max ${settings.maxResolution ? `${settings.maxResolution}p` : 'any'}, sort ${settings.sort}, diagnostics ${settings.diagnostics ? 'on' : 'off'}`);
+	installShims({ appVersion: '0.1.0', shellVersion: 'stremio-nx', storage });
 	const t0 = Date.now();
 	const core = await StremioClient.create({ log });
 	log(`core initialized in ${Date.now() - t0} ms`);
@@ -323,13 +317,21 @@ async function main(): Promise<void> {
 		},
 		trackNotice: () => state.player?.trackNotice() ?? '',
 		catalogs: () => core.catalogs(),
-		loadBoard: () => core.loadBoard(),
+		loadBoard: (onUpdate) => core.loadBoard(8, onUpdate),
 		continueWatching: () => core.continueWatching(),
 		loadCatalog: (c) => core.loadCatalog(c.addonUrl, c.type, c.id),
 		loadLibrary: () => core.loadLibrary(),
-		search: (q) => core.search(q),
-		promptText: (title, initial) => promptText(title, initial, (open) => { state.keyboardOpen = open; }),
-		loadDetails: (item, videoId) => core.loadMetaDetails(item.type, item.id, videoId),
+		search: (q, onUpdate) => core.search(q, 8, onUpdate),
+		promptText: (title, initial, onInput) => promptText(title, initial, (open) => { state.keyboardOpen = open; }, onInput),
+		loadDetails: (item, videoId, onUpdate) => core.loadMetaDetails(item.type, item.id, videoId, onUpdate),
+		getSettings: () => settings,
+		setSettings: (next) => {
+			const diagnosticsChanged = next.diagnostics !== settings.diagnostics;
+			settings = next;
+			diagnosticsLogging = next.diagnostics;
+			saveSettings(storage, next);
+			if (diagnosticsChanged) log(`diagnostics logging ${next.diagnostics ? 'on' : 'off'}`);
+		},
 		play: async (option, meta, videoId, onProgress) => {
 			// One promise that only ever rejects (cancel from B, or the timeout);
 			// raced against each stage so a stall always surfaces on screen.
@@ -370,6 +372,7 @@ async function main(): Promise<void> {
 				}
 				state.player = new MediaPlayer(input, file, {
 					log,
+					diagnostics: () => diagnosticsLogging,
 					subtitles: { addons: core.addons(), type: meta.type, videoId },
 					onChanged: () => state.ui?.invalidate(),
 					onStarted: () => { consoleHidden = true; pendingStart?.resolve(); pendingStart = undefined; },

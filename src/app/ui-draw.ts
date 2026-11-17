@@ -5,7 +5,7 @@
  * element is recorded as a hit rectangle so taps can be resolved.
  */
 import type { HitTarget, Playback, Section, UiModel, Row } from './ui';
-import { SECTIONS as ALL_SECTIONS, SECTION_TITLES } from './ui';
+import { SECTIONS as ALL_SECTIONS, SECTION_TITLES, videoLabel } from './ui';
 
 export const W = 1280;
 export const H = 720;
@@ -30,7 +30,17 @@ const COLOR = {
 	muted: '#a5a1c2',
 	dim: '#6b6789',
 	error: '#ff7b7b',
+	skeleton: '#211d3b',
 };
+
+/** Pill colours for stream badges: resolution, HDR, cache state and warnings stand out. */
+function badgeColor(badge: string): string {
+	if (/^(4K|\d+p)$/.test(badge)) return '#5b45c9';
+	if (badge === 'HDR' || badge === 'DV') return '#a8641a';
+	if (badge === 'Cached') return '#1f7a4f';
+	if (badge === 'CAM' || badge === 'Not cached') return '#8a2f3c';
+	return '#2f2a52';
+}
 
 export interface HitRect {
 	x: number;
@@ -64,6 +74,10 @@ export function drawUi(ctx: CanvasRenderingContext2D, ui: UiModel, image: ImageL
 	if (ui.screen === 'details') drawDetails(ctx, ui, image, hits);
 	else drawSection(ctx, ui, image, hits);
 	drawFooter(ctx, ui);
+	if (ui.keyboard) {
+		hits.length = 0; // the keyboard owns input while it is open
+		drawKeyboardOverlay(ctx, ui);
+	}
 	return hits;
 }
 
@@ -71,17 +85,22 @@ export function drawUi(ctx: CanvasRenderingContext2D, ui: UiModel, image: ImageL
 
 function drawSection(ctx: CanvasRenderingContext2D, ui: UiModel, image: ImageLookup, hits: HitRect[]): void {
 	drawRail(ctx, ui, hits);
-	ctx.fillStyle = COLOR.text;
-	ctx.font = 'bold 28px sans-serif';
-	ctx.fillText(clip(ctx, ui.title(), CONTENT_W), CONTENT_X, 44);
+	if (ui.section === 'search') drawSearchBar(ctx, ui, hits);
+	else {
+		ctx.fillStyle = COLOR.text;
+		ctx.font = 'bold 28px sans-serif';
+		ctx.fillText(clip(ctx, ui.title(), CONTENT_W), CONTENT_X, 44);
+	}
 	if (ui.section === 'addons') { drawAddons(ctx, ui, hits); return; }
+	if (ui.section === 'settings') { drawSettings(ctx, ui, hits); return; }
 
 	const s = ui.current();
 	if (s.rows.length === 0) {
 		if (!ui.busy) {
 			ctx.fillStyle = COLOR.muted;
 			ctx.font = '20px sans-serif';
-			ctx.fillText(ui.section === 'search' ? 'Press Y to search.' : 'Nothing here.', CONTENT_X, 110);
+			const query = ui.section === 'search' ? s.query : undefined;
+			ctx.fillText(ui.searching ? 'Searching…' : query ? `No results for “${query}”. Press Y to search again.` : ui.section === 'search' ? 'Search the catalogs of your add-ons: press Y or tap the search bar.' : 'Nothing here.', CONTENT_X, 120);
 		}
 		return;
 	}
@@ -106,7 +125,7 @@ function drawRail(ctx: CanvasRenderingContext2D, ui: UiModel, hits: HitRect[]): 
 	ctx.fillStyle = COLOR.panel;
 	ctx.fillRect(0, 0, RAIL_W, H);
 	ALL_SECTIONS.forEach((section: Section, i: number) => {
-		const y = 96 + i * 104;
+		const y = 84 + i * 96;
 		const active = ui.section === section;
 		const focused = ui.railFocused && ui.railIndex === i;
 		if (focused || active) {
@@ -118,7 +137,7 @@ function drawRail(ctx: CanvasRenderingContext2D, ui: UiModel, hits: HitRect[]): 
 		ctx.font = '12px sans-serif';
 		const label = SECTION_TITLES[section];
 		ctx.fillText(label, 44 - ctx.measureText(label).width / 2, y + 74);
-		hits.push({ x: 0, y: y - 8, w: RAIL_W, h: 96, target: { kind: 'rail', section } });
+		hits.push({ x: 0, y: y - 8, w: RAIL_W, h: 92, target: { kind: 'rail', section } });
 	});
 }
 
@@ -128,6 +147,15 @@ function drawRailIcon(ctx: CanvasRenderingContext2D, section: Section, cx: numbe
 	ctx.lineWidth = 2.5;
 	ctx.beginPath();
 	switch (section) {
+		case 'settings':
+			ctx.arc(cx, cy, 6, 0, Math.PI * 2);
+			for (let k = 0; k < 8; k++) {
+				const a = (k * Math.PI) / 4;
+				ctx.moveTo(cx + Math.cos(a) * 9, cy + Math.sin(a) * 9);
+				ctx.lineTo(cx + Math.cos(a) * 12.5, cy + Math.sin(a) * 12.5);
+			}
+			ctx.stroke();
+			return;
 		case 'addons':
 			ctx.strokeRect(cx - 11, cy - 11, 22, 22);
 			ctx.moveTo(cx - 5, cy); ctx.lineTo(cx + 5, cy);
@@ -174,8 +202,25 @@ function drawPosterRow(ctx: CanvasRenderingContext2D, row: Row, rowIndex: number
 	if (row.title) {
 		ctx.fillStyle = COLOR.text;
 		ctx.font = 'bold 22px sans-serif';
-		ctx.fillText(clip(ctx, row.title, CONTENT_W - 120), CONTENT_X, y + 22);
+		const title = clip(ctx, row.title, CONTENT_W - 220);
+		ctx.fillText(title, CONTENT_X, y + 22);
+		if (row.loading) {
+			ctx.fillStyle = COLOR.dim;
+			ctx.font = '16px sans-serif';
+			ctx.fillText('loading…', CONTENT_X + measure(ctx, title, 'bold 22px sans-serif') + 14, y + 22);
+		}
 		top = y + 46;
+	}
+	if (row.loading && row.cards.length === 0) {
+		// Placeholder cards keep the layout steady while the add-on answers.
+		for (let i = 0; i < CARDS_PER_ROW; i++) {
+			const x = CONTENT_X + i * (CARD_W + CARD_GAP);
+			ctx.fillStyle = focusedCol >= 0 && i === 0 ? COLOR.panelHi : COLOR.skeleton;
+			roundRect(ctx, x, top, CARD_W, CARD_H, 8);
+			ctx.fillStyle = COLOR.skeleton;
+			ctx.fillRect(x, top + CARD_H + 14, Math.round(CARD_W * (0.5 + ((i * 37) % 40) / 100)), 12);
+		}
+		return;
 	}
 	const n = row.cards.length;
 	const anchor = focusedCol >= 0 ? focusedCol : 0;
@@ -253,6 +298,7 @@ function drawChips(ctx: CanvasRenderingContext2D, row: Row, rowIndex: number, fo
 function drawDetails(ctx: CanvasRenderingContext2D, ui: UiModel, image: ImageLookup, hits: HitRect[]): void {
 	const d = ui.details;
 	if (!d) return;
+	if (d.mode === 'streams') { drawStreamsDetails(ctx, ui, image, hits); return; }
 	const backdrop = image(d.meta.background, 'backdrop');
 	if (backdrop && backdrop.width > 0) drawCover(ctx, backdrop, 0, 0, W, 400);
 	ctx.fillStyle = 'rgba(15, 13, 31, 0.6)';
@@ -321,6 +367,278 @@ function drawDetails(ctx: CanvasRenderingContext2D, ui: UiModel, image: ImageLoo
 		}
 		hits.push({ x: CONTENT_X - 12, y, w: CONTENT_W + 4, h: ROW_H, target: { kind: 'listRow', index: i } });
 	}
+}
+
+/**
+ * Streams: a compact header (more room for the list), the filter status line
+ * with the "show hidden" toggle, and two-line rows: quality pills and the
+ * source on top, the release name below.
+ */
+function drawStreamsDetails(ctx: CanvasRenderingContext2D, ui: UiModel, image: ImageLookup, hits: HitRect[]): void {
+	const d = ui.details!;
+	const HEADER_H = 262;
+	const backdrop = image(d.meta.background, 'backdrop');
+	if (backdrop && backdrop.width > 0) drawCover(ctx, backdrop, 0, 0, W, HEADER_H);
+	ctx.fillStyle = 'rgba(15, 13, 31, 0.68)';
+	ctx.fillRect(0, 0, W, HEADER_H);
+	ctx.fillStyle = COLOR.bg;
+	ctx.fillRect(0, HEADER_H, W, H - HEADER_H);
+
+	ctx.fillStyle = 'rgba(0, 0, 0, 0.45)';
+	roundRect(ctx, 24, 20, 96, 36, 18);
+	ctx.fillStyle = COLOR.text;
+	ctx.font = '18px sans-serif';
+	ctx.fillText('‹  Back', 44, 45);
+	hits.push({ x: 16, y: 12, w: 112, h: 52, target: { kind: 'back' } });
+
+	const logo = image(d.meta.logo, 'logo');
+	if (logo && logo.width > 0 && logo.height > 0) {
+		const scale = Math.min(1, 380 / logo.width, 96 / logo.height);
+		ctx.drawImage(logo.canvas, CONTENT_X, 70, Math.round(logo.width * scale), Math.round(logo.height * scale));
+	} else {
+		ctx.fillStyle = COLOR.text;
+		ctx.font = 'bold 38px sans-serif';
+		ctx.fillText(clip(ctx, d.meta.name, 900), CONTENT_X, 124);
+	}
+	const video = d.videos.find((v) => v.id === d.videoId);
+	const imdb = d.meta.links?.find((l) => l.category === 'imdb')?.name;
+	const metaLine = [video ? videoLabel(video) : undefined, d.meta.releaseInfo, d.meta.runtime, imdb ? `IMDb ${imdb}` : undefined].filter(Boolean).join('  ·  ');
+	ctx.fillStyle = COLOR.muted;
+	ctx.font = '18px sans-serif';
+	ctx.fillText(clip(ctx, metaLine, 1000), CONTENT_X, 190);
+	if (d.meta.description) {
+		ctx.fillStyle = '#d6d3ea';
+		ctx.font = '16px sans-serif';
+		wrap(ctx, d.meta.description, 1000, 2).forEach((line, i) => ctx.fillText(line, CONTENT_X, 218 + i * 21));
+	}
+
+	// Status line: counts, hidden streams, add-ons still answering.
+	const view = ui.streamView();
+	ctx.fillStyle = COLOR.text;
+	ctx.font = 'bold 20px sans-serif';
+	ctx.fillText('Streams', CONTENT_X, HEADER_H + 30);
+	ctx.fillStyle = COLOR.muted;
+	ctx.font = '16px sans-serif';
+	ctx.fillText(clip(ctx, ui.streamsHeader(), 760), CONTENT_X + 96, HEADER_H + 29);
+	if (view.hidden > 0) {
+		const label = d.showAll ? 'X  Hide filtered' : `X  Show ${view.hidden} hidden`;
+		ctx.font = 'bold 15px sans-serif';
+		const w = Math.round(measure(ctx, label)) + 28;
+		const x = CONTENT_X + CONTENT_W - w - 8;
+		ctx.fillStyle = d.showAll ? COLOR.accent : COLOR.panelHi;
+		roundRect(ctx, x, HEADER_H + 10, w, 28, 14);
+		ctx.fillStyle = COLOR.text;
+		ctx.fillText(label, x + 14, HEADER_H + 29);
+		hits.push({ x: x - 6, y: HEADER_H + 2, w: w + 12, h: 44, target: { kind: 'toggleHidden' } });
+	}
+
+	const rows = ui.listRows();
+	const ROW_H = 62;
+	const top = HEADER_H + 48;
+	const visible = Math.floor((H - FOOTER_H - top) / ROW_H);
+	const first = Math.max(0, Math.min(d.cursor - Math.floor(visible / 2), rows.length - visible));
+	if (rows.length === 0 && !ui.busy) {
+		ctx.fillStyle = COLOR.muted;
+		ctx.font = '18px sans-serif';
+		const empty = d.pendingAddons ? 'Waiting for your add-ons to answer…'
+			: view.hidden > 0 ? `All ${view.hidden} streams are hidden by your filters. Press X to show them, or change Settings.`
+				: 'No streams from your add-ons for this title.';
+		ctx.fillText(clip(ctx, empty, CONTENT_W), CONTENT_X, top + 30);
+	}
+	for (let i = first; i < Math.min(rows.length, first + visible); i++) {
+		const y = top + (i - first) * ROW_H;
+		const row = rows[i];
+		const focused = i === d.cursor;
+		if (focused) {
+			ctx.fillStyle = row.enabled ? COLOR.accent : COLOR.accentDim;
+			roundRect(ctx, CONTENT_X - 12, y, CONTENT_W + 4, ROW_H - 6, 8);
+		}
+		ctx.globalAlpha = row.dimmed && !focused ? 0.5 : 1;
+		let x = CONTENT_X;
+		ctx.font = 'bold 13px sans-serif';
+		for (const badge of row.badges ?? []) {
+			const w = Math.round(measure(ctx, badge)) + 16;
+			if (x + w > CONTENT_X + CONTENT_W - 330) break;
+			ctx.fillStyle = badgeColor(badge);
+			roundRect(ctx, x, y + 7, w, 21, 10);
+			ctx.fillStyle = COLOR.text;
+			ctx.fillText(badge, x + 8, y + 22);
+			x += w + 6;
+		}
+		if (row.detail) {
+			ctx.fillStyle = row.dimmed ? '#ffb4a8' : focused ? '#e6e0ff' : COLOR.muted;
+			ctx.font = '15px sans-serif';
+			const text = clip(ctx, row.detail, 320);
+			ctx.fillText(text, CONTENT_X + CONTENT_W - 16 - measure(ctx, text), y + 23);
+		}
+		ctx.fillStyle = row.enabled ? (focused ? COLOR.text : '#dcd8f0') : COLOR.dim;
+		ctx.font = '17px sans-serif';
+		ctx.fillText(clip(ctx, row.label, CONTENT_W - 24), CONTENT_X, y + 47);
+		ctx.globalAlpha = 1;
+		hits.push({ x: CONTENT_X - 12, y, w: CONTENT_W + 4, h: ROW_H, target: { kind: 'listRow', index: i } });
+	}
+}
+
+// ---- search bar and keyboard overlay ----
+
+function drawMagnifier(ctx: CanvasRenderingContext2D, cx: number, cy: number, color: string): void {
+	ctx.strokeStyle = color;
+	ctx.lineWidth = 2.5;
+	ctx.beginPath();
+	ctx.arc(cx - 2, cy - 2, 8, 0, Math.PI * 2);
+	ctx.moveTo(cx + 4, cy + 4);
+	ctx.lineTo(cx + 10, cy + 10);
+	ctx.stroke();
+}
+
+/**
+ * A text field: the text scrolls so the caret stays visible; the caret is a
+ * bar at `cursor` (or no caret when `cursor` is undefined).
+ */
+function drawTextField(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, text: string, placeholder: string, cursor: number | undefined, focused: boolean, icon: boolean): void {
+	ctx.fillStyle = focused ? '#2b2550' : COLOR.panel;
+	roundRect(ctx, x, y, w, h, h / 2);
+	if (focused) {
+		ctx.strokeStyle = COLOR.accent;
+		ctx.lineWidth = 2;
+		ctx.beginPath();
+		ctx.roundRect(x + 1, y + 1, w - 2, h - 2, h / 2 - 1);
+		ctx.stroke();
+	}
+	let left = x + 22;
+	if (icon) { drawMagnifier(ctx, x + 30, y + h / 2, focused ? COLOR.text : COLOR.muted); left = x + 56; }
+	const right = x + w - 22;
+	const baseline = y + h / 2 + 8;
+	ctx.font = '22px sans-serif';
+	if (!text) {
+		ctx.fillStyle = COLOR.dim;
+		ctx.fillText(clip(ctx, placeholder, right - left), left, baseline);
+		if (cursor !== undefined) { ctx.fillStyle = COLOR.text; ctx.fillRect(left, y + 12, 2, h - 24); }
+		return;
+	}
+	// Scroll: show the end of a long text, keeping the caret in view.
+	const max = right - left;
+	const caret = cursor ?? text.length;
+	let start = 0;
+	while (start < caret && ctx.measureText(text.slice(start, caret)).width > max - 12) start++;
+	let shown = text.slice(start);
+	while (shown.length > 0 && ctx.measureText(shown).width > max) shown = shown.slice(0, -1);
+	ctx.fillStyle = COLOR.text;
+	ctx.fillText(shown, left, baseline);
+	if (cursor !== undefined) {
+		const cx = left + ctx.measureText(text.slice(start, caret)).width;
+		ctx.fillRect(Math.round(cx) + 1, y + 12, 2, h - 24);
+	}
+}
+
+/** The search bar at the top of the Search section (tap or Y opens the keyboard). */
+function drawSearchBar(ctx: CanvasRenderingContext2D, ui: UiModel, hits: HitRect[]): void {
+	const s = ui.current();
+	const typing = ui.keyboard?.kind === 'search';
+	drawTextField(ctx, CONTENT_X, 14, CONTENT_W, 52, typing ? ui.keyboard!.text : s.query ?? '', 'Search movies and series', typing ? ui.keyboard!.cursor : undefined, typing, true);
+	if (!typing) {
+		ctx.fillStyle = COLOR.panelHi;
+		roundRect(ctx, CONTENT_X + CONTENT_W - 50, 26, 30, 28, 14);
+		ctx.fillStyle = COLOR.text;
+		ctx.font = 'bold 16px sans-serif';
+		ctx.fillText('Y', CONTENT_X + CONTENT_W - 40, 46);
+	}
+	hits.push({ x: CONTENT_X, y: 10, w: CONTENT_W, h: 60, target: { kind: 'searchBar' } });
+}
+
+/**
+ * Drawn while a keyboard prompt is open: the inline keyboard covers the
+ * bottom of the screen and has no text field, so the field (with caret)
+ * goes at the top, over a dimmed screen. Search also lists the matches
+ * found so far between the field and the keyboard.
+ */
+function drawKeyboardOverlay(ctx: CanvasRenderingContext2D, ui: UiModel): void {
+	const k = ui.keyboard!;
+	const keyboardTop = H - (k.height > 0 ? Math.min(k.height, H - 200) : 380);
+	if (k.kind === 'search') {
+		// Opaque: a clean list of matches, the field exactly where the search bar sits.
+		ctx.fillStyle = COLOR.bg;
+		ctx.fillRect(0, 0, W, H);
+		const x = CONTENT_X, w = CONTENT_W;
+		drawTextField(ctx, x, 14, w, 52, k.text, k.placeholder ?? 'Search', k.cursor, true, true);
+		const lineH = 36;
+		const top = 84;
+		const room = Math.max(0, Math.floor((keyboardTop - top - 14) / lineH));
+		const matches = ui.searchMatches(room);
+		ctx.font = '17px sans-serif';
+		ctx.fillStyle = COLOR.muted;
+		const status = k.text.trim().length < 2 ? 'Type at least 2 letters. Results appear as you type; OK shows them all.'
+			: ui.searching && matches.length === 0 ? 'Searching…'
+				: matches.length === 0 ? (ui.sections.search.query === k.text.trim() ? 'No matches.' : '')
+					: '';
+		if (status) ctx.fillText(status, x + 22, top + 22);
+		matches.forEach((m, i) => {
+			const y = top + i * lineH;
+			if (i % 2 === 0) { ctx.fillStyle = COLOR.panel; roundRect(ctx, x, y, w, lineH - 4, 8); }
+			ctx.fillStyle = COLOR.text;
+			ctx.font = '20px sans-serif';
+			const name = clip(ctx, m.name, w - 200);
+			ctx.fillText(name, x + 22, y + 24);
+			ctx.fillStyle = COLOR.muted;
+			ctx.font = '16px sans-serif';
+			ctx.fillText(m.type === 'series' ? 'Series' : m.type === 'movie' ? 'Movie' : m.type, x + 36 + measure(ctx, name, '20px sans-serif'), y + 24);
+		});
+		return;
+	}
+	ctx.fillStyle = COLOR.bg;
+	ctx.fillRect(0, 0, W, H);
+	const x = CONTENT_X, w = CONTENT_W;
+	ctx.fillStyle = COLOR.text;
+	ctx.font = 'bold 24px sans-serif';
+	ctx.fillText(clip(ctx, k.label, w), x, 52);
+	drawTextField(ctx, x, 70, w, 58, k.text, k.placeholder ?? '', k.cursor, true, false);
+}
+
+// ---- settings ----
+
+function drawSettings(ctx: CanvasRenderingContext2D, ui: UiModel, hits: HitRect[]): void {
+	const rows = ui.settingRows();
+	ctx.fillStyle = COLOR.muted;
+	ctx.font = '17px sans-serif';
+	ctx.fillText('Stream filters apply to every title. On a stream list, X shows what they hide.', CONTENT_X, 78);
+	const ROW_H = 46;
+	const top = 96;
+	const helpTop = H - FOOTER_H - 62;
+	const visible = Math.floor((helpTop - 10 - top) / ROW_H);
+	const first = Math.max(0, Math.min(ui.settingsCursor - Math.floor(visible / 2), rows.length - visible));
+	for (let i = first; i < Math.min(rows.length, first + visible); i++) {
+		const row = rows[i];
+		const y = top + (i - first) * ROW_H;
+		const focused = !ui.railFocused && i === ui.settingsCursor;
+		ctx.fillStyle = focused ? COLOR.accent : COLOR.panel;
+		roundRect(ctx, CONTENT_X, y, CONTENT_W, ROW_H - 6, 8);
+		ctx.fillStyle = COLOR.text;
+		ctx.font = '19px sans-serif';
+		ctx.fillText(row.label, CONTENT_X + 16, y + 27);
+		const right = CONTENT_X + CONTENT_W - 16;
+		if (row.kind === 'choice') {
+			ctx.font = 'bold 18px sans-serif';
+			const value = row.value;
+			const vw = measure(ctx, value);
+			ctx.fillStyle = focused ? COLOR.text : COLOR.muted;
+			ctx.fillText(value, right - 26 - vw, y + 27);
+			ctx.fillText('‹', right - 46 - vw, y + 27);
+			ctx.fillText('›', right - 10, y + 27);
+			hits.push({ x: right - 70 - vw, y, w: 40, h: ROW_H - 6, target: { kind: 'settingStep', index: i, step: -1 } });
+			hits.push({ x: right - 30, y, w: 40, h: ROW_H - 6, target: { kind: 'settingStep', index: i, step: 1 } });
+			hits.push({ x: CONTENT_X, y, w: CONTENT_W - 92 - vw, h: ROW_H - 6, target: { kind: 'settingRow', index: i } });
+		} else {
+			ctx.font = row.kind === 'text' ? '18px sans-serif' : 'bold 16px sans-serif';
+			const value = row.kind === 'text' ? clip(ctx, row.value, 520) : (ui.resetConfirm ? 'Press A again' : 'A');
+			ctx.fillStyle = focused ? COLOR.text : COLOR.muted;
+			ctx.fillText(value, right - measure(ctx, value), y + 27);
+			hits.push({ x: CONTENT_X, y, w: CONTENT_W, h: ROW_H - 6, target: { kind: 'settingRow', index: i } });
+		}
+	}
+	const help = rows[ui.settingsCursor]?.help ?? '';
+	ctx.fillStyle = '#d6d3ea';
+	ctx.font = '16px sans-serif';
+	wrap(ctx, help, CONTENT_W, 2).forEach((line, i) => ctx.fillText(line, CONTENT_X, helpTop + 20 + i * 22));
 }
 
 // ---- player on-screen display ----
@@ -403,6 +721,10 @@ export function drawOsd(ctx: CanvasRenderingContext2D, ui: UiModel, playback: Pl
 		ctx.fillStyle = COLOR.muted;
 		ctx.font = '16px sans-serif';
 		ctx.fillText('Paused', CONTENT_X + 56, H - 20);
+	} else if (playback?.notice) {
+		ctx.fillStyle = '#ffcf8a';
+		ctx.font = '16px sans-serif';
+		ctx.fillText(clip(ctx, playback.notice, CONTENT_W - 56), CONTENT_X + 56, H - 20);
 	}
 	if (ui.mediaMenu) drawTracks(ctx, ui, hits);
 }
@@ -530,14 +852,51 @@ export function fmtTime(seconds: number): string {
 	return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}` : `${m}:${String(sec).padStart(2, '0')}`;
 }
 
+// Text layout cache. A redraw re-lays out the same strings (titles, descriptions,
+// stream names) and each clip is a binary search of measureText calls into
+// native code, so results are memoized per font and width. Bounded: cleared
+// wholesale when full, which costs one slower frame.
+const TEXT_CACHE_MAX = 6000;
+const widths = new Map<string, number>();
+const layouts = new Map<string, string | string[]>();
+
+/** Cached `measureText(text).width` in the current (or given) font. */
+export function measure(ctx: CanvasRenderingContext2D, text: string, font = ctx.font): number {
+	const key = `${font}\u0000${text}`;
+	let w = widths.get(key);
+	if (w === undefined) {
+		if (widths.size >= TEXT_CACHE_MAX) widths.clear();
+		const previous = ctx.font;
+		if (font !== previous) ctx.font = font;
+		w = ctx.measureText(text).width;
+		if (font !== previous) ctx.font = previous;
+		widths.set(key, w);
+	}
+	return w;
+}
+
+function remember<T extends string | string[]>(key: string, compute: () => T): T {
+	const hit = layouts.get(key);
+	if (hit !== undefined) return hit as T;
+	if (layouts.size >= TEXT_CACHE_MAX) layouts.clear();
+	const value = compute();
+	layouts.set(key, value);
+	return value;
+}
+
 /** Greedy word wrap into at most `maxLines` lines; the last line is clipped with an ellipsis. */
 export function wrap(ctx: CanvasRenderingContext2D, text: string, maxWidth: number, maxLines: number): string[] {
+	return remember(`w\u0000${ctx.font}\u0000${maxWidth}\u0000${maxLines}\u0000${text}`, () => wrapUncached(ctx, text, maxWidth, maxLines));
+}
+
+function wrapUncached(ctx: CanvasRenderingContext2D, text: string, maxWidth: number, maxLines: number): string[] {
 	const words = text.replace(/\s+/g, ' ').trim().split(' ');
 	const lines: string[] = [];
 	let line = '';
 	for (const word of words) {
 		const candidate = line ? `${line} ${word}` : word;
 		if (ctx.measureText(candidate).width <= maxWidth || !line) {
+			// (uncached on purpose: candidates are one-off strings that would only churn the width cache)
 			line = candidate;
 			continue;
 		}
@@ -550,6 +909,10 @@ export function wrap(ctx: CanvasRenderingContext2D, text: string, maxWidth: numb
 }
 
 export function clip(ctx: CanvasRenderingContext2D, text: string, maxWidth: number): string {
+	return remember(`c\u0000${ctx.font}\u0000${maxWidth}\u0000${text}`, () => clipUncached(ctx, text, maxWidth));
+}
+
+function clipUncached(ctx: CanvasRenderingContext2D, text: string, maxWidth: number): string {
 	if (ctx.measureText(text).width <= maxWidth) return text;
 	let lo = 0;
 	let hi = text.length;

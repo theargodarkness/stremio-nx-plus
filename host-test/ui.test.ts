@@ -7,6 +7,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { CatalogRef, CatalogRow, MetaDetails, MetaItem, MetaPreview, StreamOption } from '../src/stremio/client';
 import { UiModel, boardRows, gridRows, type Playback, type UiServices } from '../src/app/ui';
+import { DEFAULT_SETTINGS, type Settings } from '../src/app/settings';
 
 const cinemeta: CatalogRef = { addonName: 'Cinemeta', addonUrl: 'http://cm/manifest.json', type: 'movie', id: 'top', name: 'Popular' };
 const pd: CatalogRef = { addonName: 'PD', addonUrl: 'http://pd/manifest.json', type: 'movie', id: 'pd', name: 'Public Domain' };
@@ -280,10 +281,302 @@ test('a dismissed search prompt and a failed load leave a message, not a crash',
 	const ui = new UiModel(services);
 	await settle();
 	assert.equal(ui.message, 'Failed: offline');
-	ui.press('l'); // wraps to add-ons
+	ui.press('l'); // wraps to settings
+	ui.press('l'); // add-ons
 	ui.press('l'); // search
 	await settle();
 	assert.equal(ui.section, 'search');
-	assert.equal(ui.message, 'Press Y to search.');
+	assert.equal(ui.message, '', 'dismissing restores the previous (empty) state; the search screen explains what to do');
+	assert.equal(ui.keyboard, undefined);
 	assert.equal(ui.busy, false);
+});
+
+// ---- filters, settings and progressive loading ----
+
+const uhdStream: StreamOption = { addonName: 'T', addonUrl: 'http://t', stream: { name: 'T\n4k', title: 'Film.2160p.HDR.x265\n💾 20 GB', infoHash: 'cd'.repeat(20) } };
+const fhdStream: StreamOption = { addonName: 'T', addonUrl: 'http://t', stream: { name: 'T\n1080p', title: 'Film.1080p.x264\n💾 4 GB', infoHash: 'ef'.repeat(20) } };
+const debridStream: StreamOption = { addonName: 'D', addonUrl: 'http://d', stream: { name: '[RD+] D\n1080p', title: 'Film.1080p.WEB-DL', url: 'https://debrid.example/1' } };
+
+test('streams arrive progressively without moving the cursor off the focused stream', async () => {
+	const calls: string[] = [];
+	let update: ((d: MetaDetails) => void) | undefined;
+	const { services } = fake(calls, {
+		loadDetails: async (it, _videoId, onUpdate) => { update = onUpdate; return { meta: { ...it }, streams: [fhdStream], pendingAddons: 1 }; },
+	});
+	const ui = new UiModel(services); await settle();
+	ui.press('a'); await settle();
+	assert.equal(ui.screen, 'details');
+	assert.equal(ui.busy, false, 'the details screen opens before the slow add-on answers');
+	assert.equal(ui.listRows().length, 1);
+	assert.match(ui.streamsHeader(), /waiting for 1 add-on/);
+	assert.ok(update, 'a progressive listener was passed');
+	update!({ meta: ui.details!.meta, streams: [debridStream, fhdStream], pendingAddons: 0 });
+	assert.equal(ui.listRows().length, 2);
+	assert.equal(ui.details!.cursor, 1, 'still on the 1080p torrent');
+	assert.doesNotMatch(ui.streamsHeader(), /waiting/);
+	ui.press('a'); await settle();
+	assert.ok(calls.some((c) => c.startsWith('play cw1/') && c.endsWith('efef')), 'played the stream that was focused');
+});
+
+test('4K is hidden by default; X reveals it dimmed with the reason, and it still plays', async () => {
+	const calls: string[] = [];
+	const { services } = fake(calls, { loadDetails: async (it) => ({ meta: { ...it }, streams: [uhdStream, fhdStream] }) });
+	const ui = new UiModel(services); await settle();
+	ui.press('a'); await settle();
+	assert.deepEqual(ui.listRows().map((r) => r.badges?.[0]), ['1080p']);
+	assert.match(ui.hint(), /X show 1 hidden/);
+	assert.match(ui.streamsHeader(), /1 hidden by filters/);
+	ui.press('x');
+	const rows = ui.listRows();
+	assert.equal(rows.length, 2);
+	assert.equal(rows[1].dimmed, true);
+	assert.equal(rows[1].detail, 'Hidden: 4K');
+	assert.deepEqual(rows[1].badges?.slice(0, 3), ['4K', 'HDR', 'HEVC']);
+	ui.press('down');
+	ui.press('a'); await settle();
+	assert.ok(calls.some((c) => c.endsWith('cdcd')), 'the revealed 4K stream plays on request');
+	ui.stopPlayback();
+	ui.press('x');
+	assert.equal(ui.listRows().length, 1);
+	assert.equal(ui.details!.cursor, 0, 'cursor clamps when the focused stream hides again');
+});
+
+test('when every stream is filtered the hint says how to see them', async () => {
+	const { services } = fake([], { loadDetails: async (it) => ({ meta: { ...it }, streams: [uhdStream] }) });
+	const ui = new UiModel(services); await settle();
+	ui.press('a'); await settle();
+	assert.equal(ui.listRows().length, 0);
+	assert.match(ui.hint(), /X show 1 hidden/);
+	ui.press('a'); await settle(); // nothing to play: no crash, no player
+	assert.equal(ui.screen, 'details');
+});
+
+test('settings: cycle, edit words, reset; changes persist and the stream list follows', async () => {
+	const saved: Settings[] = [];
+	const calls: string[] = [];
+	const { services } = fake(calls, {
+		getSettings: () => ({ ...DEFAULT_SETTINGS }),
+		setSettings: (s) => { saved.push(s); },
+		loadDetails: async (it) => ({ meta: { ...it }, streams: [uhdStream, fhdStream] }),
+		promptText: async () => 'x264, cam',
+	});
+	const ui = new UiModel(services); await settle();
+	ui.press('l');
+	assert.equal(ui.section, 'settings');
+	assert.equal(ui.settingRows()[0].value, '1080p');
+	ui.press('left'); // 1080p -> 1440p
+	ui.press('left'); // -> 4K
+	assert.equal(ui.settingRows()[0].value, '4K');
+	assert.equal(saved.at(-1)?.maxResolution, 2160);
+	const wordsIndex = ui.settingRows().findIndex((r) => r.kind === 'text');
+	for (let i = 0; i < wordsIndex; i++) ui.press('down');
+	ui.press('a'); await settle();
+	assert.equal(saved.at(-1)?.excludeKeywords, 'x264, cam');
+	assert.equal(ui.settingRows()[wordsIndex].value, 'x264, cam');
+	// The stream list uses the new settings: 4K allowed but HDR still hidden; x264 excluded.
+	ui.press('r'); // wraps to home
+	ui.press('a'); await settle();
+	assert.equal(ui.listRows().length, 0);
+	assert.match(ui.streamsHeader(), /2 hidden/);
+	ui.press('b');
+	ui.press('l');
+	for (let i = 0; i < 20; i++) ui.press('down');
+	ui.press('a');
+	assert.equal(ui.resetConfirm, true);
+	ui.press('a');
+	assert.deepEqual(saved.at(-1), DEFAULT_SETTINGS);
+	assert.equal(ui.settingRows()[0].value, '1080p');
+	ui.press('b');
+	assert.equal(ui.railFocused, true, 'B leaves the settings list for the rail');
+});
+
+test('the home board fills in as catalogs answer and keeps the cursor on its row', async () => {
+	let release: () => void = () => {};
+	const popular: CatalogRow = { id: 'top', type: 'movie', name: 'Popular', addonName: 'Cinemeta', addonId: 'cm', items: [item('m1'), item('m2')], ref: cinemeta };
+	const slowLoading: CatalogRow = { id: 'pd', type: 'movie', name: 'Public Domain', addonName: 'PD', addonId: 'pd', items: [], ref: pd, loading: true };
+	const slowReady: CatalogRow = { ...slowLoading, items: [item('p1')], loading: undefined };
+	const { services } = fake([], {
+		continueWatching: () => [],
+		loadBoard: (onUpdate) => new Promise((resolve) => {
+			onUpdate?.([slowLoading, popular]);
+			release = () => resolve([slowReady, popular]);
+		}),
+	});
+	const ui = new UiModel(services); await settle();
+	const home = ui.current();
+	assert.equal(home.rows.length, 2);
+	assert.equal(home.rows[0].loading, true);
+	assert.equal(ui.busy, false, 'browsable while the slow catalog loads');
+	ui.press('down');
+	ui.press('right');
+	assert.equal(ui.focusedCard()?.meta.id, 'm2');
+	release(); await settle();
+	assert.equal(home.rows[0].loading, undefined);
+	assert.equal(ui.focusedCard()?.meta.id, 'm2', 'cursor stayed on the same card');
+	assert.equal(ui.message, '');
+});
+
+test('a slow details update from a title the user left is ignored', async () => {
+	const updates = new Map<string, (d: MetaDetails) => void>();
+	const { services } = fake([], {
+		loadDetails: async (it, _v, onUpdate) => { if (onUpdate) updates.set(it.id, onUpdate); return { meta: { ...it }, streams: [], pendingAddons: 1 }; },
+	});
+	const ui = new UiModel(services); await settle();
+	ui.press('a'); await settle(); // cw1
+	ui.press('b');
+	ui.press('down');
+	ui.press('a'); await settle(); // m1
+	assert.equal(ui.details!.meta.id, 'm1');
+	updates.get('cw1')!({ meta: { ...item('cw1') }, streams: [fhdStream], pendingAddons: 0 });
+	assert.equal(ui.details!.meta.id, 'm1');
+	assert.equal(ui.listRows().length, 0, 'stale streams did not leak into the new title');
+	updates.get('m1')!({ meta: ui.details!.meta, streams: [fhdStream], pendingAddons: 0 });
+	assert.equal(ui.listRows().length, 1);
+});
+
+test('search shows that it is searching, then the results or a no-results line for the query', async () => {
+	let finish: (rows: CatalogRow[]) => void = () => {};
+	const { services } = fake([], {
+		promptText: async () => '  harbor  ',
+		search: (_q, onUpdate) => new Promise((resolve) => { onUpdate?.([]); finish = resolve; }),
+	});
+	const ui = new UiModel(services); await settle();
+	ui.press('l'); ui.press('l'); ui.press('l'); // settings, add-ons, search
+	await settle();
+	assert.equal(ui.section, 'search');
+	assert.equal(ui.searching, true);
+	assert.equal(ui.current().query, 'harbor', 'the query is trimmed');
+	finish([]); await settle();
+	assert.equal(ui.searching, false);
+	assert.equal(ui.message, 'No results for “harbor”.');
+});
+
+// ---- search rewrite: in-app search bar over the inline keyboard ----
+
+/** A controllable keyboard: the test types, submits or cancels; the UI sees live input. */
+function keyboardFake() {
+	const opened: { ok: string; initial: string }[] = [];
+	let input: ((text: string, cursor: number, height: number) => void) | undefined;
+	let resolve: ((v: string | null) => void) | undefined;
+	return {
+		opened,
+		promptText: (ok: string, initial: string, onInput?: (text: string, cursor: number, height: number) => void) => {
+			opened.push({ ok, initial });
+			input = onInput;
+			onInput?.(initial, initial.length, 330);
+			return new Promise<string | null>((r) => { resolve = r; });
+		},
+		type: (text: string) => input?.(text, text.length, 330),
+		submit: (text: string) => { input?.(text, text.length, 330); resolve?.(text); },
+		cancel: () => resolve?.(null),
+	};
+}
+
+const harborRows = (q: string): CatalogRow[] => [{ id: 'top', type: 'movie', name: 'Popular', addonName: 'Cinemeta', addonId: 'cm', items: [item(`${q}-1`), item(`${q}-2`)], ref: cinemeta }];
+
+test('search opens an empty field every time and shows the typed text with the caret', async () => {
+	const kb = keyboardFake();
+	const searched: string[] = [];
+	const { services } = fake([], { promptText: kb.promptText, search: async (q) => { searched.push(q); return harborRows(q); } });
+	const ui = new UiModel(services); await settle();
+	ui.press('y'); await settle(); // Y from home goes to Search with the keyboard open
+	assert.equal(ui.section, 'search');
+	assert.equal(ui.keyboard?.kind, 'search');
+	assert.equal(kb.opened[0].initial, '');
+	kb.type('harb');
+	assert.equal(ui.keyboard?.text, 'harb');
+	assert.equal(ui.keyboard?.cursor, 4);
+	assert.equal(ui.keyboard?.height, 330, 'the keyboard height arrives for the layout');
+	kb.submit('harbor'); await settle();
+	assert.equal(ui.keyboard, undefined);
+	assert.deepEqual(searched, ['harbor']);
+	assert.equal(ui.focusedCard()?.meta.id, 'harbor-1', 'OK focuses the first result');
+	ui.press('y'); await settle();
+	assert.equal(kb.opened[1].initial, '', 'a new search starts with an empty field');
+	kb.cancel(); await settle();
+});
+
+test('while the keyboard is open no button or tap reaches the screen behind it', async () => {
+	const kb = keyboardFake();
+	const calls: string[] = [];
+	const { services } = fake(calls, { promptText: kb.promptText });
+	const ui = new UiModel(services); await settle();
+	const before = { section: ui.section, row: ui.current().row, col: ui.current().col };
+	ui.press('y'); await settle();
+	const search = { row: ui.current().row, col: ui.current().col };
+	for (const b of ['a', 'b', 'x', 'up', 'down', 'left', 'right', 'l', 'r'] as const) ui.press(b);
+	ui.tap({ kind: 'rail', section: 'home' });
+	ui.tap({ kind: 'card', row: 0, col: 0 });
+	ui.swipe(1, 1);
+	await settle();
+	assert.equal(ui.section, 'search', 'L/R and rail taps were ignored');
+	assert.equal(ui.screen, 'section', 'A/card taps opened nothing');
+	assert.deepEqual({ row: ui.current().row, col: ui.current().col }, search);
+	assert.ok(!calls.some((c) => c.startsWith('details')));
+	assert.equal(ui.hint(), '', 'no footer hints for buttons that do nothing');
+	kb.cancel(); await settle();
+	assert.equal(ui.keyboard, undefined);
+	void before;
+});
+
+test('results appear as you type after a pause; OK with the same text does not search again', async () => {
+	UiModel.searchDebounceMs = 20;
+	try {
+		const kb = keyboardFake();
+		const searched: string[] = [];
+		const { services } = fake([], { promptText: kb.promptText, search: async (q) => { searched.push(q); return harborRows(q); } });
+		const ui = new UiModel(services); await settle();
+		ui.press('y'); await settle();
+		kb.type('h');
+		kb.type('ha');
+		kb.type('har');
+		await new Promise((r) => setTimeout(r, 60));
+		assert.deepEqual(searched, ['har'], 'one search after typing pauses; single letters are not searched');
+		assert.deepEqual(ui.searchMatches(5).map((m) => m.id), ['har-1', 'har-2'], 'matches listed above the keyboard');
+		kb.submit('har'); await settle();
+		assert.deepEqual(searched, ['har'], 'OK reused the live results');
+		assert.equal(ui.focusedCard()?.meta.id, 'har-1');
+	} finally {
+		UiModel.searchDebounceMs = 600;
+	}
+});
+
+test('cancelling a search restores the previous results, even after live results replaced them', async () => {
+	UiModel.searchDebounceMs = 10;
+	try {
+		const kb = keyboardFake();
+		const { services } = fake([], { promptText: kb.promptText, search: async (q) => harborRows(q) });
+		const ui = new UiModel(services); await settle();
+		ui.press('y'); await settle();
+		kb.submit('harbor'); await settle();
+		ui.press('right');
+		assert.equal(ui.focusedCard()?.meta.id, 'harbor-2');
+		ui.press('y'); await settle();
+		kb.type('ember');
+		await new Promise((r) => setTimeout(r, 40));
+		assert.equal(ui.searchMatches(1)[0]?.id, 'ember-1', 'live results for the new text');
+		kb.cancel(); await settle();
+		assert.equal(ui.current().query, 'harbor');
+		assert.equal(ui.focusedCard()?.meta.id, 'harbor-2', 'back where the user was');
+	} finally {
+		UiModel.searchDebounceMs = 600;
+	}
+});
+
+test('other keyboard prompts show their label and text above the keyboard too', async () => {
+	const kb = keyboardFake();
+	const saved: Settings[] = [];
+	const { services } = fake([], { promptText: kb.promptText, getSettings: () => ({ ...DEFAULT_SETTINGS }), setSettings: (x) => { saved.push(x); } });
+	const ui = new UiModel(services); await settle();
+	ui.press('l'); // settings
+	const words = ui.settingRows().findIndex((r) => r.kind === 'text');
+	for (let i = 0; i < words; i++) ui.press('down');
+	ui.press('a'); await settle();
+	assert.equal(ui.keyboard?.kind, 'text');
+	assert.equal(ui.keyboard?.label, 'Excluded words');
+	kb.type('3D, HDTS');
+	assert.equal(ui.keyboard?.text, '3D, HDTS');
+	kb.submit('3D, HDTS'); await settle();
+	assert.equal(saved.at(-1)?.excludeKeywords, '3D, HDTS');
+	assert.equal(ui.keyboard, undefined);
 });

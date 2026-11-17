@@ -20,8 +20,27 @@ Browse catalogs and play torrents or direct HTTP links, including compatible deb
 | A | Select; pause or resume playback |
 | B | Back; stop playback |
 | L/R | Switch sections |
-| Y | Search; open audio/subtitle selection during playback |
+| Y | Search (from Home, Discover, Library or Search); open audio/subtitle selection during playback |
+| X | On a stream list: show or hide the streams your filters removed |
 | + | Exit |
+
+## Stream filters
+
+Open **Settings** (the gear at the bottom of the rail) to choose which streams appear. The defaults suit the Switch:
+
+| Setting | Default | Why |
+| --- | --- | --- |
+| Maximum resolution | 1080p | 4K decodes and scales poorly on the Switch |
+| Hide HDR | On | No HDR tone mapping: HDR10/HDR10+/HLG look washed out |
+| Hide Dolby Vision | On | DV-only files show green/purple colours |
+| Hide AV1 and 10-bit H.264 | On | No hardware decoder; software decoding drops frames |
+| Hide CAM, TS and screeners | On | Camcorder and telesync rips |
+| Hide HEVC, Hide REMUX, Maximum file size, Sources, Hide uncached debrid | Off | Optional |
+| Excluded words | None | Comma-separated, e.g. `3D, HDTS` |
+| Sort streams | Add-on order | Or best quality, smallest first, most seeders |
+| Diagnostics logging | Off | Per-second player stats in `torrent-log.txt` (costs CPU) |
+
+Quality is read from the stream names add-ons send. A stream whose resolution or size is not listed is never hidden by those filters. The stream list shows each stream's resolution, HDR, codec, size, seeders and debrid cache state as tags. The header shows how many streams the filters hid; press X to show them dimmed, each with the reason it was hidden.
 
 ## Add-ons
 

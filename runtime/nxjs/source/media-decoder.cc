@@ -3,6 +3,7 @@
 // device runtime and the host nxjs-test binary.
 #include "media-decoder.h"
 #include "audio-graph.h"
+#include "frame-convert.h"
 #include "http-reader.h"
 #include "media-source.h"
 
@@ -89,7 +90,9 @@ struct nx_media {
 	std::mutex subtitle_mutex;
 	std::deque<subtitle_cue> subtitles;
 	std::string track_error;
-	SwsContext *sws = nullptr;
+	SwsContext *sws = nullptr; // single-threaded fallback conversion
+	// Two-core BGRA conversion (decode thread + helper on another core).
+	nx_frame_converter *converter = nullptr;
 	SwrContext *swr = nullptr;
 
 	// ---- metadata ----
@@ -342,6 +345,9 @@ bool enqueue_video(nx_media *m, AVFrame *frame, double pts) {
 	}
 	uint64_t w = m->vwrite.load(std::memory_order_relaxed);
 	video_slot *slot = &m->slots[w % RING_SLOTS];
+	// Colour metadata lives on the decoder's frame; a hardware download does not copy it.
+	const int colorspace = frame->colorspace;
+	const int color_range = frame->color_range;
 	if (frame->hw_frames_ctx) {
 		const auto transfer_start = std::chrono::steady_clock::now();
 		const auto *frames = reinterpret_cast<const AVHWFramesContext *>(frame->hw_frames_ctx->data);
@@ -362,6 +368,13 @@ bool enqueue_video(nx_media *m, AVFrame *frame, double pts) {
 	}
 
 	const auto convert_start = std::chrono::steady_clock::now();
+	if (m->converter &&
+	    nx_frame_convert(m->converter, frame, colorspace, color_range, slot->bgra, m->render_width, m->render_height) == 0) {
+		record_frame_time(m->convert_peak_us, convert_start);
+		slot->pts = pts;
+		m->vwrite.store(w + 1, std::memory_order_release);
+		return true;
+	}
 	m->sws = sws_getCachedContext(m->sws, frame->width, frame->height,
 	                              (AVPixelFormat)frame->format, m->render_width,
 	                              m->render_height, AV_PIX_FMT_BGRA, SWS_BILINEAR,
@@ -617,6 +630,10 @@ void decode_subtitle(nx_media *m, AVPacket *pkt, double seek_drop_until) {
 }
 
 void decode_thread_main(nx_media *m) {
+	// Off core 0: that core runs the JS main thread (UI, network feed, GL
+	// presentation) and the audio renderer. Conversion help goes to core 2.
+	nx_pin_current_thread(1);
+	m->converter = nx_frame_converter_new(2);
 	AVPacket *pkt = av_packet_alloc();
 	AVFrame *frame = av_frame_alloc();
 	if (!pkt || !frame) {
@@ -1290,6 +1307,8 @@ void nx_media_destroy(nx_media_t *m) {
 	m->ctl_cv.notify_all();
 	if (m->thread.joinable())
 		m->thread.join();
+	nx_frame_converter_free(m->converter);
+	m->converter = nullptr;
 	if (m->audio_node)
 		nx_audio_stream_set_playing(m->audio_node, false);
 	if (m->sws)

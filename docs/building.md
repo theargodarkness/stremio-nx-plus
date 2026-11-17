@@ -13,6 +13,25 @@ The build compiles the vendored nx.js runtime, bundles the app, packages
 Checksums and build metadata are written to `artifacts/`.
 
 Native compilation uses the Docker image pinned in `scripts/build-runtime.sh`.
+
+**Native changes need the full build.** Changes under `runtime/nxjs/source`
+(such as the two-core video conversion in `frame-convert.cc`) only reach the
+NRO through `npm run build:nro`, which rebuilds the runtime in the toolchain
+container. The repository's GitHub Actions workflow does this on every push:
+the NRO is in the run's `stremio-nx-<commit>` artifact. `npm run native-check`
+compiles the conversion path and the decoder against the host's FFmpeg and
+benchmarks them (it needs FFmpeg development packages; see
+`host-test/native/run.sh`).
+
+**App-only changes without Docker:** if `src/` is all you changed, you can
+reuse the native runtime from a release NRO. The packager keeps its native
+code and replaces only the app RomFS (the verifier checks the native part is
+unchanged):
+
+```sh
+curl -L -o runtime/nxjs.nro https://github.com/jrgf/stremio-nx/releases/latest/download/stremio-nx.nro
+npm run build:app && npm run nro && node scripts/verify-nro.mjs
+```
 It contains the Switch toolchain, V8, Skia, FFmpeg and the other native libraries.
 No sibling checkout or prebuilt local NRO is required. For an incremental app
 change, run `npm run build:app` followed by `npm run nro`.
@@ -24,6 +43,7 @@ npm run typecheck
 npm run host-test:unit
 node host-test/player-check.mjs
 node host-test/video-render-check.mjs
+npm run core-progressive   # progressive loading against the real core, local mock add-ons
 ```
 
 The networking tests need permission to bind local sockets. Device playback
