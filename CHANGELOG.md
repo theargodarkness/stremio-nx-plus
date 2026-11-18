@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.1: sign-in keyboard fix
+
+### Fixed
+- **The password keyboard accepted no input.** Sign-in opens a second keyboard right after the first closes. The console's keyboard, shown in the same frame it was confirmed in, comes up without accepting text. A prompt now waits 0.7 s after the previous one closed before opening (the field is shown meanwhile, and buttons stay with the prompt).
+- The runtime left its per-frame keyboard update running after OK or cancel and started another with every prompt, so repeated searches stacked them. The leftover one is now stopped after each prompt.
+
 ## 0.7.0: Stremio account, smoother start
 
 ### Added

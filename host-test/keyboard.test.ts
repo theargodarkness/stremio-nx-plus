@@ -6,7 +6,9 @@
  */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { promptKeyboard } from '../src/app/keyboard';
+import { keyboardTiming, promptKeyboard } from '../src/app/keyboard';
+
+keyboardTiming.reopenGapMs = 0; // the cases below are about event order; the reopen gap has its own test
 import { Input } from '../src/app/input';
 
 class FakeKeyboard extends EventTarget {
@@ -127,4 +129,63 @@ test('typed text, caret moves and the keyboard height reach the UI as they happe
 	const count = seen.length;
 	kb.type('after close');
 	assert.equal(seen.length, count, 'no input reports once the prompt has settled');
+});
+
+/**
+ * The console keyboard as it behaved on hardware: shown within a moment of
+ * closing, it appears but accepts nothing. And like the runtime, every
+ * show() starts an update loop that OK/cancel leave running until hide().
+ */
+class RealisticKeyboard extends FakeKeyboard {
+	closedAt = -Infinity; dead = false; loops = 0; shows = 0;
+	show() { this.shows++; this.loops++; this.dead = Date.now() - this.closedAt < 40; super.show(); }
+	hide() { this.loops = 0; }
+	type(text: string) { if (!this.dead) super.type(text); }
+	submit(text: string) { this.closedAt = Date.now(); if (this.dead) { this.cancel(); return; } super.submit(text); }
+	cancel() { this.closedAt = Date.now(); super.cancel(); }
+}
+
+test('a second prompt right after the first waits for the keyboard to close, then accepts input', async () => {
+	keyboardTiming.reopenGapMs = 60;
+	try {
+		const kb = new RealisticKeyboard();
+		const opened: boolean[] = [];
+		await new Promise((r) => setTimeout(r, 70)); // clear of earlier tests' closes
+		const email = promptKeyboard(kb, 'Next', '', (o) => opened.push(o));
+		kb.submit('me@example.com');
+		assert.equal(await email, 'me@example.com');
+		// The password prompt is requested at once, as the sign-in flow does.
+		const seen: string[] = [];
+		const password = promptKeyboard(kb, 'Sign in', '', (o) => opened.push(o), () => {}, (text) => seen.push(text));
+		assert.deepEqual(opened, [true, false, true], 'input stays with the prompt while it waits to open');
+		assert.equal(kb.shows, 1, 'not shown again in the same moment');
+		await new Promise((r) => setTimeout(r, 90));
+		assert.equal(kb.shows, 2);
+		assert.equal(kb.dead, false, 'opened after the gap: it accepts input');
+		assert.equal(kb.loops, 1, "the first prompt's leftover update loop was stopped");
+		kb.type('hunter2');
+		kb.submit('hunter2');
+		assert.equal(await password, 'hunter2');
+		assert.equal(seen.at(-1), 'hunter2');
+	} finally {
+		keyboardTiming.reopenGapMs = 0;
+	}
+});
+
+test('a prompt abandoned while waiting to open never shows the keyboard', async () => {
+	keyboardTiming.reopenGapMs = 60;
+	try {
+		const kb = new RealisticKeyboard();
+		await new Promise((r) => setTimeout(r, 70));
+		const first = promptKeyboard(kb, 'Next', '', () => {});
+		kb.cancel();
+		assert.equal(await first, null);
+		const second = promptKeyboard(kb, 'Next', '', () => {});
+		await new Promise((r) => setTimeout(r, 90));
+		kb.cancel();
+		assert.equal(await second, null);
+		assert.equal(kb.shows, 2);
+	} finally {
+		keyboardTiming.reopenGapMs = 0;
+	}
 });

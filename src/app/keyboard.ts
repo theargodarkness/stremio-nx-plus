@@ -9,7 +9,18 @@
  * as a dismissal once the current event dispatch has finished without a
  * `submit` (checked in a microtask).
  */
+/**
+ * The console's keyboard needs a moment between closing and opening again:
+ * shown in the same frame it was confirmed in, it comes up without accepting
+ * input (two prompts in a row, such as email then password). The runtime
+ * also leaves its per-frame keyboard update running after OK or cancel, and
+ * a second copy starts with every show; `hide()` stops the stray one.
+ */
+export const keyboardTiming = { reopenGapMs: 700 };
+let lastClosedAt = Number.NEGATIVE_INFINITY;
+
 export interface KeyboardLike {
+	hide?(): void;
 	value: string;
 	cursorIndex?: number;
 	maxLength?: number;
@@ -35,6 +46,12 @@ export function promptKeyboard(kb: KeyboardLike, title: string, initial: string,
 			kb.removeEventListener('geometrychange', onGeometry);
 			kb.removeEventListener('change', onChange);
 			kb.removeEventListener('cursormove', onChange);
+			clearTimeout(opening);
+			if (shown) {
+				lastClosedAt = Date.now();
+				// After this dispatch returns: stop the runtime's leftover update loop.
+				setTimeout(() => { try { kb.hide?.(); } catch { /* already hidden */ } }, 0);
+			}
 			onOpen(false);
 			resolve(value);
 		};
@@ -45,21 +62,31 @@ export function promptKeyboard(kb: KeyboardLike, title: string, initial: string,
 			// Hidden: a dismissal, unless the `submit` that follows OK arrives in this same dispatch.
 			if (kb.boundingRect.height === 0) void Promise.resolve().then(() => finish(null));
 		};
-		kb.addEventListener('submit', onSubmit);
-		kb.addEventListener('change', onChange);
-		kb.addEventListener('cursormove', onChange);
-		kb.okButtonText = title.slice(0, 8);
-		kb.maxLength = 120;
-		kb.value = initial;
+		let shown = false;
+		let opening: ReturnType<typeof setTimeout> | undefined;
+		const open = () => {
+			if (settled) return;
+			try {
+				kb.addEventListener('submit', onSubmit);
+				kb.addEventListener('change', onChange);
+				kb.addEventListener('cursormove', onChange);
+				kb.okButtonText = title.slice(0, 8);
+				kb.maxLength = 120;
+				kb.value = initial;
+				shown = true;
+				kb.show(); // dispatches its own geometry event synchronously
+				log(`keyboard shown: ${JSON.stringify(kb.boundingRect)}`);
+				kb.addEventListener('geometrychange', onGeometry); // a zero rect from here on = hidden
+				report(); // initial text and the keyboard's height for the layout
+			} catch (err) {
+				log(`keyboard failed: ${err instanceof Error ? err.message : String(err)}`);
+				finish(null);
+			}
+		};
+		// Input belongs to the prompt from now on, also while waiting to reopen.
 		onOpen(true);
-		try {
-			kb.show(); // dispatches its own geometry event synchronously
-			log(`keyboard shown: ${JSON.stringify(kb.boundingRect)}`);
-			kb.addEventListener('geometrychange', onGeometry); // a zero rect from here on = hidden
-			report(); // initial text and the keyboard's height for the layout
-		} catch (err) {
-			log(`keyboard failed: ${err instanceof Error ? err.message : String(err)}`);
-			finish(null);
-		}
+		const wait = keyboardTiming.reopenGapMs - (Date.now() - lastClosedAt);
+		if (wait > 0) opening = setTimeout(open, wait);
+		else open();
 	});
 }

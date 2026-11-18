@@ -29,7 +29,7 @@ import { loadTrackPrefs, preferredTrack, saveTrackPrefs } from './track-prefs';
 /** No real clock reads earlier than this build; an earlier date means the console's clock is wrong. */
 const BUILD_EPOCH = Date.UTC(2026, 10, 1);
 
-const BUILD = 'stremio-nx build 0.7.0-account-smooth-start-20261117';
+const BUILD = 'stremio-nx build 0.7.1-keyboard-reopen-20261117';
 
 const CONTROL_PORT = 11470;
 const ADDON_PORT = 11471;
