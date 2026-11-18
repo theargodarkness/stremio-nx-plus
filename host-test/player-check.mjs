@@ -92,7 +92,7 @@ for (const transport of ['HTTP', 'torrent']) {
 		await until(() => source.buffered(0) >= 48 * MiB && active === 0);
 		const filledRequests = ranges.length;
 		for (let i = 0; i < 8; i++) { source.position += 64 * 1024; await new Promise(resolve => setTimeout(resolve, 65)); }
-		assert.equal(ranges.length, filledRequests, 'full cache must not cause tiny HTTP top-ups');
+		assert.ok(ranges.length <= filledRequests + (input instanceof Torrent ? 0 : 1), 'full cache must not cause tiny HTTP top-ups');
 		assert.equal(player.tracks('audio').length, 2); await player.selectTrack('audio', '2'); assert.equal(video.selectedAudioTrack, 2);
 		player.togglePause(); assert.equal(video.paused, true); player.togglePause();
 
@@ -150,11 +150,43 @@ for (const transport of ['HTTP', 'torrent']) {
 		while (active < 3) { assert.ok(Date.now() - t0 < 10000, `starving playback must open up to three connections:\n${logs.slice(-3).join('\n')}`); await new Promise(resolve => setTimeout(resolve, 25)); }
 		assert.equal(new Set(ranges.map(r => r.start)).size, ranges.length, 'lanes fetch distinct ranges');
 		assert.ok(ranges.every(r => r.end < 48 * MiB), 'lanes stay inside the read-ahead goal');
+		assert.ok(ranges.every(r => r.end - r.start + 1 <= 8 * MiB), 'a starving player uses parallel fixed ranges, not a paced one');
 		deny = 1; delay = 5; input.cancel();
 		await until(() => logs.some(l => l.includes('HTTP 429')));
 		await until(() => logs.some(l => /lanes \d\/1 /.test(l)));
 		await until(() => source.buffered(0) >= 12 * MiB && active === 0);
 		assert.equal(failure, undefined);
 		console.log('PASS: HTTP lanes grow while starving and shrink to one after HTTP 429');
+	} finally { player.stop(); }
+}
+
+// Steady HTTP playback: one paced long request instead of a connection (and TLS handshake) per 8 MiB.
+{
+	delay = 5; ranges.length = 0;
+	const input = new HttpStream({ url: 'https://video.example/movie' });
+	await input.open();
+	let failure, started = false, resumedTo;
+	const logs = [];
+	const player = new MediaPlayer(input, { length, path: ['movie.mkv'] }, { log(line) { logs.push(line); }, onStarted() { started = true; resumedTo = source.position; }, onError(error) { failure = error; },
+		resumeAt: (duration) => { assert.equal(duration, 100); return 10; } });
+	player.start();
+	try {
+		await until(() => started);
+		// Resume happens before the first frame: playback starts at the resume point with its startup buffer there.
+		assert.equal(resumedTo, 10 * MiB, 'the seek to the resume point precedes playback');
+		assert.equal(player.resumedAt, 10);
+		assert.ok(source.buffered(10 * MiB) >= 12 * MiB, 'startup buffer filled at the resume point');
+		assert.ok(!logs.some(l => l.startsWith('buffering:')), 'no start-then-rebuffer cycle');
+		await until(() => source.buffered(source.position) >= 48 * MiB && active === 0);
+		const before = ranges.length, from = source.position;
+		for (let i = 0; i < 80; i++) { source.position += MiB / 2; await new Promise(resolve => setTimeout(resolve, 30)); }
+		await new Promise(resolve => setTimeout(resolve, 300));
+		assert.ok(ranges.length - before <= 2, `steady playback opened ${ranges.length - before} new connections for 40 MiB`);
+		assert.ok(ranges.some(r => r.end - r.start + 1 > 8 * MiB), 'a long paced range was requested');
+		const ahead = source.buffered(source.position);
+		assert.ok(ahead >= 36 * MiB && ahead <= 64 * MiB, `pacing keeps the read-ahead goal without overshooting: ${(ahead / MiB).toFixed(1)} MiB`);
+		assert.equal(source.position - from, 40 * MiB);
+		assert.equal(failure, undefined);
+		console.log(`PASS: resume before the first frame; 40 MiB of steady playback used ${ranges.length - before} new connection(s) (was 5)`);
 	} finally { player.stop(); }
 }

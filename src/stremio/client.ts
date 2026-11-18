@@ -154,6 +154,9 @@ interface ContinueWatchingState {
 	items: { _id: string; name: string; type: string; poster?: string; state?: { timeOffset?: number; duration?: number } }[];
 }
 
+/** A core event: `event` names it; errors carry `args.error` and the `args.source` event they answer. */
+export interface CoreEventArgs { event?: string; args?: { error?: { message?: string; code?: number; type?: string }; source?: { event?: string } } & Record<string, unknown> }
+
 export const CINEMETA = 'https://v3-cinemeta.strem.io/manifest.json';
 const DEFAULT_TIMEOUT_MS = 30000;
 /** How long progressive loads keep waiting for slow add-ons before showing what arrived. */
@@ -161,6 +164,7 @@ const SLOW_ADDON_MS = 25000;
 
 export class StremioClient {
 	#core: StremioCore;
+	#eventListeners = new Set<(event: CoreEventArgs) => void>();
 	/** Change listeners per state field (several flows may wait on one field). */
 	#waiters = new Map<string, Set<() => void>>();
 	#log: (msg: string) => void;
@@ -182,10 +186,56 @@ export class StremioClient {
 			} else if (event.name === 'CoreEvent') {
 				// Add-on descriptors can contain private configuration tokens in URLs.
 				log(`core event: ${(event.args as { event?: string } | null)?.event ?? 'update'}`);
+				if (client) for (const fn of [...client.#eventListeners]) fn(event.args as CoreEventArgs);
 			}
 		});
 		client = new StremioClient(core, log);
 		return client;
+	}
+
+	/** Calls `fn` for every core event (results and errors of actions) until the returned function is called. */
+	onEvent(fn: (event: CoreEventArgs) => void): () => void {
+		this.#eventListeners.add(fn);
+		return () => { this.#eventListeners.delete(fn); };
+	}
+
+	/** The signed-in Stremio account, or null. */
+	account(): { email: string } | null {
+		const auth = this.getState<{ profile: { auth?: { user?: { email?: string } } | null } }>('ctx').profile.auth;
+		return auth?.user?.email ? { email: auth.user.email } : null;
+	}
+
+	/**
+	 * Sign in to a Stremio account. The core then loads the account's add-ons
+	 * and library (watch history, Continue Watching) in place of the local
+	 * ones and keeps them in sync. Rejects with the API's reason.
+	 */
+	signIn(email: string, password: string): Promise<void> {
+		return new Promise<void>((resolve, reject) => {
+			const done = (error?: Error) => { clearTimeout(timer); off(); error ? reject(error) : resolve(); };
+			const timer = setTimeout(() => done(new Error('The Stremio account service did not answer.')), DEFAULT_TIMEOUT_MS);
+			const off = this.onEvent((event) => {
+				if (event.event === 'UserAuthenticated') done();
+				else if (event.event === 'Error' && event.args?.source?.event === 'UserAuthenticated') {
+					const message = event.args.error?.message ?? 'Sign-in failed.';
+					done(new Error(/passphrase|password|user not found/i.test(message) ? 'Wrong email or password.' : message));
+				}
+			});
+			this.dispatch({ action: 'Ctx', args: { action: 'Authenticate', args: { type: 'Login', email, password, facebook: false } } });
+		});
+	}
+
+	/** Sign out: the local profile (default add-ons, empty library) returns. */
+	async signOut(): Promise<void> {
+		this.dispatch({ action: 'Ctx', args: { action: 'Logout' } });
+		await this.waitState<{ profile: { auth?: unknown } }>('ctx', (s) => !s.profile.auth);
+	}
+
+	/** Fetch changes made on other devices (library and add-ons); no-op when signed out. */
+	syncAccount(): void {
+		if (!this.account()) return;
+		this.dispatch({ action: 'Ctx', args: { action: 'SyncLibraryWithAPI' } });
+		this.dispatch({ action: 'Ctx', args: { action: 'PullAddonsFromAPI' } });
 	}
 
 	dispatch(action: unknown, field: string | null = null): void {
@@ -492,9 +542,11 @@ export function torrentRequestFromStream(stream: Stream, extraTrackers: string[]
 	};
 }
 
-function libraryToPreview(item: { _id: string; name: string; type: string; poster?: string; state?: { timeOffset?: number; duration?: number } }): MetaPreview {
+function libraryToPreview(item: { _id: string; name: string; type: string; poster?: string; progress?: number | null; state?: { timeOffset?: number; duration?: number } }): MetaPreview {
+	// The core reports progress as a percentage; older states carry offset and duration.
 	const { timeOffset = 0, duration = 0 } = item.state ?? {};
-	return { id: item._id, name: item.name, type: item.type, poster: item.poster, progress: duration > 0 ? Math.min(1, timeOffset / duration) : undefined };
+	const progress = typeof item.progress === 'number' && item.progress > 0 ? Math.min(1, item.progress / 100) : duration > 0 ? Math.min(1, timeOffset / duration) : undefined;
+	return { id: item._id, name: item.name, type: item.type, poster: item.poster ?? undefined, progress };
 }
 
 function unwrap<T>(loadable: Loadable<T>, what: string): T {

@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.7.0: Stremio account, smoother start
+
+### Added
+- **Stremio account sign-in** (Settings > Stremio account). Email, then password (masked on screen). The core then uses the account's library and add-ons: Continue Watching on Home and the Library section show what was watched on any device, and progress made here syncs back. Changes from other devices are fetched at launch. Signing out restores the add-ons installed on the console. The password is not stored or logged; the core keeps the session key in its profile.
+
+### Fixed
+- **Stutter while the video downloads** (debrid and direct links). Every 8 MiB range was a new connection, and its TLS handshake runs on the thread that also presents video: a 60-100 ms hitch per request, several in a row at the start (diagnostics showed `render gap` jump from about 18 ms to 60-118 ms exactly when `requests` rose). A healthy player now reads one long request (up to 64 MiB) at the pace of playback instead. Parallel fixed ranges remain for startup, seeks and a link that cannot keep up.
+- **Start, pause, refill when resuming.** The resume seek happened after playback began, discarding the startup buffer. It now happens before the first frame, so the buffer fills at the resume point.
+- Continue Watching and Library cards show their progress bar (the core reports a percentage, which was not read).
+- A request dropped by the server while paused no longer uses up its retries when progress was made in between.
+
+### Developer
+- `player-check`: resume before the first frame, and steady playback opening at most 2 connections per 40 MiB (was 5). `npm run core-account`: sign-in, sync and sign-out against the real stremio-core with a local account API.
+
 ## 0.6.0: video modes and GPU colour conversion
 
 ### Added

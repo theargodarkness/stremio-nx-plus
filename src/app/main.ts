@@ -29,7 +29,7 @@ import { loadTrackPrefs, preferredTrack, saveTrackPrefs } from './track-prefs';
 /** No real clock reads earlier than this build; an earlier date means the console's clock is wrong. */
 const BUILD_EPOCH = Date.UTC(2026, 10, 1);
 
-const BUILD = 'stremio-nx build 0.6.0-video-modes-20261117';
+const BUILD = 'stremio-nx build 0.7.0-account-smooth-start-20261117';
 
 const CONTROL_PORT = 11470;
 const ADDON_PORT = 11471;
@@ -279,6 +279,9 @@ async function main(): Promise<void> {
 	const t0 = Date.now();
 	const core = await StremioClient.create({ log });
 	log(`core initialized in ${Date.now() - t0} ms`);
+	// Signed in: fetch what other devices watched and installed since the last launch.
+	log(`account: ${core.account() ? 'signed in' : 'not signed in'}`);
+	core.syncAccount();
 	const server = await core.reloadStreamingServer();
 	log(`streaming server model: settings ${server.settings.type}, base ${server.baseUrl}`);
 	const pairingCode = Array.from(crypto.getRandomValues(new Uint8Array(4)), b => b.toString(16).padStart(2, '0')).join('').toUpperCase();
@@ -356,6 +359,9 @@ async function main(): Promise<void> {
 			return rows;
 		},
 		clockWrong: () => Date.now() < BUILD_EPOCH,
+		account: () => core.account(),
+		signIn: async (email, password) => { await core.signIn(email, password); log('account: signed in'); },
+		signOut: async () => { await core.signOut(); log('account: signed out'); },
 		continueWatching: () => core.continueWatching(),
 		loadCatalog: (c) => core.loadCatalog(c.addonUrl, c.type, c.id),
 		loadLibrary: () => core.loadLibrary(),
@@ -413,6 +419,7 @@ async function main(): Promise<void> {
 					log,
 					diagnostics: () => diagnosticsLogging,
 					videoMode: () => settings.videoMode,
+					resumeAt: (duration) => resumePoint(core.playerProgress(videoId).resumeMs, duration),
 					subtitles: { addons: core.addons(), type: meta.type, videoId },
 					// Add-on subtitles arrive after playback starts: the remembered language may be among them.
 					onChanged: () => { state.ui?.invalidate(); if (!pendingStart) applyTrackPrefs(); },
@@ -425,14 +432,11 @@ async function main(): Promise<void> {
 				});
 				state.player.start();
 				await Promise.race([began, failure]);
-				// Resume where the user stopped (the library entry may load after the stream did).
 				const started = state.player;
 				tracksChosen = false;
 				applyTrackPrefs();
-				const resumeAt = resumePoint(core.playerProgress(videoId).resumeMs, started.playback().duration);
-				if (resumeAt > 0) { log(`resume at ${resumeAt}s`); started.seekTo(resumeAt); }
 				watch = new WatchReporter(core, () => (state.player === started ? started.playback() : null));
-				return { resumedAt: resumeAt || undefined };
+				return { resumedAt: started.resumedAt };
 			} catch (err) {
 				stop();
 				throw err;
@@ -448,6 +452,12 @@ async function main(): Promise<void> {
 		log,
 	};
 	state.ui = new UiModel(services);
+	// Account sync finishing after the first screen: show what it brought.
+	core.onEvent((event) => {
+		const args = event.args as { ids?: unknown[]; transport_urls?: unknown[] } | undefined;
+		if (event.event === 'LibraryItemsPulledFromAPI' && args?.ids?.length) state.ui?.libraryChanged();
+		if (event.event === 'AddonsPulledFromAPI' && args?.transport_urls?.length) { state.ui?.addonsChanged(); state.ui?.libraryChanged(); }
+	});
 	log(`ui ready: ${core.catalogs().length} catalogs`);
 }
 

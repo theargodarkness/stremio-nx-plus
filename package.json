@@ -1,6 +1,6 @@
 {
   "name": "stremio-nx",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "private": true,
   "description": "Independent Stremio-compatible video player for Nintendo Switch homebrew",
   "author": "jrgf",
@@ -19,7 +19,8 @@
     "dht-live": "esbuild --bundle --platform=node --target=node22 --format=esm --outfile=host-test/dist/dht-live.mjs host-test/dht-live.ts && node host-test/dist/dht-live.mjs",
     "core-progressive": "esbuild --bundle --platform=node --target=node22 --format=esm --loader:.wasm=binary --outfile=host-test/dist/core-progressive.mjs host-test/core-progressive.ts && node host-test/dist/core-progressive.mjs",
     "native-check": "bash host-test/native/run.sh",
-    "core-watch": "esbuild --bundle --platform=node --target=node22 --format=esm --loader:.wasm=binary --outfile=host-test/dist/core-watch.mjs host-test/core-watch.ts && node host-test/dist/core-watch.mjs"
+    "core-watch": "esbuild --bundle --platform=node --target=node22 --format=esm --loader:.wasm=binary --outfile=host-test/dist/core-watch.mjs host-test/core-watch.ts && node host-test/dist/core-watch.mjs",
+    "core-account": "esbuild --bundle --platform=node --target=node22 --format=esm --loader:.wasm=binary --outfile=host-test/dist/core-account.mjs host-test/core-account.ts && node host-test/dist/core-account.mjs"
   },
   "dependencies": {
     "@stremio/stremio-core-web": "0.62.1"

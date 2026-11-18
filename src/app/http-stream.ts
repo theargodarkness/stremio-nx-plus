@@ -4,6 +4,21 @@ import { httpUrl } from '../stremio/streams';
 export const HTTP_CHUNK = 8 * 1024 * 1024; // Range size amortizes connection/redirect costs.
 export const HTTP_FEED_CHUNK = 256 * 1024; // Bound each copy into the native playback cache.
 /**
+ * Size of one paced request. Every request is a new connection, and its TLS
+ * handshake runs on the thread that also presents video (a visible hitch of
+ * tens of milliseconds). A healthy player therefore reads one long range and
+ * waits between reads (`pace`) instead of opening a connection per 8 MiB.
+ * Bounded so that a response body buffered without backpressure stays small.
+ */
+export const HTTP_PACED_SPAN = 64 * 1024 * 1024;
+
+export interface ReadOptions {
+	/** Allow up to HTTP_PACED_SPAN in one request. */
+	long?: boolean;
+	/** Awaited before each network read; resolve when more bytes are welcome. */
+	pace?: () => Promise<void> | void;
+}
+/**
  * Max concurrent range requests. The runtime opens a fresh socket per fetch
  * (`connection: close`), so one lane is bounded by a single TCP window per
  * round trip; a starving player adds lanes (see player.ts).
@@ -52,12 +67,13 @@ export class HttpStream {
 	 * Feed a range progressively; only one small delivery block is accumulated.
 	 * `signal` cancels just this range (a lane the player no longer needs).
 	 */
-	async read(start: number, count: number, provide: (offset: number, bytes: Uint8Array) => void, signal?: AbortSignal): Promise<void> {
+	async read(start: number, count: number, provide: (offset: number, bytes: Uint8Array) => void, signal?: AbortSignal, options: ReadOptions = {}): Promise<void> {
 		if (this.#closed || signal?.aborted) throw new DOMException('Stream stopped.', 'AbortError');
 		if (this.#requests.size >= HTTP_LANES) throw new Error('Too many concurrent stream reads.');
 		if (!Number.isSafeInteger(start) || start < 0 || !Number.isSafeInteger(count) || count <= 0) throw new Error('Invalid stream range.');
 		if (this.length && start >= this.length) return;
-		count = Math.min(count, HTTP_CHUNK, this.length ? this.length - start : HTTP_CHUNK);
+		const limit = options.long ? HTTP_PACED_SPAN : HTTP_CHUNK;
+		count = Math.min(count, limit, this.length ? this.length - start : limit);
 		const end = start + count - 1;
 		if (!Number.isSafeInteger(end)) throw new Error('Invalid stream range.');
 		const controller = new AbortController();
@@ -65,15 +81,20 @@ export class HttpStream {
 		signal?.addEventListener('abort', abort, { once: true });
 		this.#requests.add(controller);
 		let next = start;
+		let failedAt = -1;
 		try {
 			for (let attempt = 0; ; attempt++) {
 				try {
 					await this.#readRange(next, end, (offset, bytes) => {
 						provide(offset, bytes);
 						next = offset + bytes.length;
-					}, controller.signal);
+					}, controller.signal, options.pace);
 					return;
 				} catch (error) {
+					// A long-lived request may be dropped by the server (e.g. while the
+					// user paused); progress since the last failure earns fresh attempts.
+					if (next > failedAt && failedAt >= 0) attempt = 0;
+					failedAt = next;
 					if (controller.signal.aborted) throw new DOMException('Stream cancelled.', 'AbortError');
 					if (!(error instanceof RetryableReadError)) throw error;
 					// Already delivered complete blocks need not be downloaded again.
@@ -95,7 +116,7 @@ export class HttpStream {
 		}
 	}
 
-	async #readRange(start: number, end: number, provide: (offset: number, bytes: Uint8Array) => void, signal: AbortSignal): Promise<void> {
+	async #readRange(start: number, end: number, provide: (offset: number, bytes: Uint8Array) => void, signal: AbortSignal, pace?: () => Promise<void> | void): Promise<void> {
 		if (signal.aborted) throw new DOMException('Stream cancelled.', 'AbortError');
 		const controller = new AbortController();
 		const abort = () => controller.abort();
@@ -184,6 +205,15 @@ export class HttpStream {
 					used += take;
 					offset += take;
 					if (used === batch.length) {
+						if (pace) {
+							// Hold this block until the player wants it; nothing more is read
+							// from the socket meanwhile. Waiting for the player is not a
+							// stalled server: the inactivity timer is suspended.
+							clearTimeout(timer);
+							await pace();
+							if (controller.signal.aborted) throw new DOMException('Stream cancelled.', 'AbortError');
+							activity();
+						}
 						provide(start + offset - used, batch);
 						used = 0;
 						if (offset < size) batch = new Uint8Array(Math.min(HTTP_FEED_CHUNK, size - offset));

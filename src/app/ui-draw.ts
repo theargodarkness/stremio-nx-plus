@@ -607,7 +607,8 @@ function drawKeyboardOverlay(ctx: CanvasRenderingContext2D, ui: UiModel): void {
 	ctx.fillStyle = COLOR.text;
 	ctx.font = 'bold 24px sans-serif';
 	ctx.fillText(clip(ctx, k.label, w), x, 52);
-	drawTextField(ctx, x, 70, w, 58, k.text, k.placeholder ?? '', k.cursor, true, false);
+	// Passwords are never drawn: one mark per character.
+	drawTextField(ctx, x, 70, w, 58, k.kind === 'password' ? '*'.repeat(k.text.length) : k.text, k.placeholder ?? '', k.cursor, true, false);
 }
 
 // ---- settings ----
@@ -645,7 +646,7 @@ function drawSettings(ctx: CanvasRenderingContext2D, ui: UiModel, hits: HitRect[
 			hits.push({ x: CONTENT_X, y, w: CONTENT_W - 92 - vw, h: ROW_H - 6, target: { kind: 'settingRow', index: i } });
 		} else {
 			ctx.font = row.kind === 'text' ? '18px sans-serif' : 'bold 16px sans-serif';
-			const value = row.kind === 'text' ? clip(ctx, row.value, 520) : (ui.resetConfirm ? 'Press A again' : 'A');
+			const value = row.kind === 'text' ? clip(ctx, row.value, 520) : (focused && ui.resetConfirm ? 'Press A again' : clip(ctx, row.value || 'A', 520));
 			ctx.fillStyle = focused ? COLOR.text : COLOR.muted;
 			ctx.fillText(value, right - measure(ctx, value), y + 27);
 			hits.push({ x: CONTENT_X, y, w: CONTENT_W, h: ROW_H - 6, target: { kind: 'settingRow', index: i } });

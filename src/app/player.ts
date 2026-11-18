@@ -5,7 +5,7 @@
  * per-second stats line; the caller draws `video` and `status`.
  */
 import type { TorrentEngine } from '../torrent/engine';
-import { HttpStream, HTTP_CHUNK, HTTP_LANES } from './http-stream';
+import { HttpStream, HTTP_CHUNK, HTTP_FEED_CHUNK, HTTP_LANES, HTTP_PACED_SPAN } from './http-stream';
 import { bufferTargets } from './buffering';
 import { probes } from './main';
 import { fetchTextLimited, type Addon } from '../stremio/addons';
@@ -35,6 +35,8 @@ export interface PlayerOptions {
 	 * heap walk (10-30 ms JS stalls) and the long log line built every second.
 	 */
 	diagnostics?: () => boolean;
+	/** Where to resume, in seconds (0 = from the start); asked once, when the length is known. */
+	resumeAt?: (durationSeconds: number) => number;
 	/** Settings > Video mode, read when the video is created. */
 	videoMode?: () => VideoMode;
 }
@@ -48,6 +50,9 @@ export class MediaPlayer {
 	subtitleNotice = '';
 	#subtitleSelection = 'off';
 	#gpuUnavailable = false;
+	#resumeChecked = false;
+	/** Seconds playback resumed from, when it did. */
+	resumedAt?: number;
 	#imageId = 0;
 	#image?: SubtitleImage;
 	#subtitleOptions: SubtitleOption[] = [];
@@ -238,15 +243,28 @@ export class MediaPlayer {
 		// HTTP lanes: concurrent range requests, each owning one entry in `pending`.
 		// The lane count adapts once per second in the stats tick: up while the
 		// buffer is starving below twice the bitrate, down to one on HTTP 429.
-		const pending: { from: number; to: number; next: number; abort: AbortController }[] = [];
+		const pending: { from: number; to: number; next: number; abort: AbortController; long?: boolean }[] = [];
 		let lanes = 0;
 		let laneTarget = 1;
 		let laneMax = HTTP_LANES;
 		let laneTicks = 0; // stats ticks since the lane count last changed
+		let slowTicks = 0; // consecutive stats ticks a paced request delivered below the bitrate
 		const cursorNow = () => { const wanted = source.wanted; return wanted >= 0 ? wanted : source.position; };
 		const updatePlayback = (cursor: number) => {
 			const ahead = source.buffered(cursor);
 			const remaining = Math.max(0, file.length - cursor);
+			if (!this.#started && !this.#resumeChecked && video.readyState >= 2) {
+				// Resume before the first frame plays: the startup buffer then fills at
+				// the resume point, instead of starting at 0:00, seeking and refilling.
+				this.#resumeChecked = true;
+				const at = this.#opts.resumeAt?.(video.duration) ?? 0;
+				if (at > 0) {
+					this.resumedAt = at;
+					log(`resume at ${at}s`);
+					video.currentTime = at;
+					return;
+				}
+			}
 			if (!this.#started && video.readyState >= 2 && ahead >= Math.min(targets.startup, remaining)) {
 				this.#started = true;
 				this.video = video;
@@ -274,9 +292,23 @@ export class MediaPlayer {
 				from += source.buffered(from);
 				for (const p of pending) if (p.from <= from && from < p.to) from = p.to;
 			}
-			// Leave one range of headroom instead of opening tiny top-up requests.
-			if (from >= file.length || from - cursor > targets.ahead - HTTP_CHUNK) return undefined;
+			if (from >= file.length) return undefined;
+			// A healthy buffer is topped up by ONE long request read at the pace of
+			// playback: each new request costs a connection and a TLS handshake on
+			// this thread, which shows as a hitch in the picture.
+			if (pending.length === 0 && this.#started && !this.#rebuffering && source.buffered(cursor) >= targets.resume && from - cursor <= targets.ahead) {
+				return { from, to: Math.min(file.length, from + HTTP_PACED_SPAN), next: from, abort: new AbortController(), long: true };
+			}
+			// Filling up (startup, seek, starvation): parallel fixed ranges, leaving
+			// one range of headroom instead of opening tiny top-up requests.
+			if (from - cursor > targets.ahead - HTTP_CHUNK) return undefined;
 			return { from, to: Math.min(file.length, from + HTTP_CHUNK), next: from, abort: new AbortController() };
+		};
+		/** Hold a long request while the read-ahead goal is met (the socket then waits, the connection stays). */
+		const pace = async (range: { next: number; abort: AbortController; long?: boolean }) => {
+			while (range.long && !this.#stopped && !range.abort.signal.aborted && range.next - cursorNow() > targets.ahead - HTTP_FEED_CHUNK) {
+				await new Promise((resolve) => setTimeout(resolve, 100));
+			}
 		};
 		const runLane = async () => {
 			lanes++;
@@ -290,6 +322,9 @@ export class MediaPlayer {
 					try {
 						await this.#http!.read(range.from, range.to - range.from, (offset, bytes) => {
 							if (this.#stopped) throw new DOMException('Playback stopped.', 'AbortError');
+							// A long range cut short (starvation: parallel ranges take over past `to`).
+							if (offset >= range.to) throw new DOMException('Range shortened.', 'AbortError');
+							if (offset + bytes.length > range.to) bytes = bytes.subarray(0, range.to - offset);
 							range.next = offset + bytes.length;
 							const now = cursorNow();
 							if (range.to <= now) throw new DOMException('Seek moved past this range.', 'AbortError');
@@ -301,7 +336,7 @@ export class MediaPlayer {
 							source.provide(from, bytes.subarray(from - offset, to - offset));
 							feedIoMs = Math.max(feedIoMs, performance.now() - ioStart);
 							updatePlayback(now);
-						}, range.abort.signal);
+						}, range.abort.signal, range.long ? { long: true, pace: () => pace(range) } : undefined);
 					} finally { pending.splice(pending.indexOf(range), 1); }
 					// Continue immediately while there is room for another full range.
 				}
@@ -396,6 +431,16 @@ export class MediaPlayer {
 			lastStatsAt = tickStart;
 			lastReceived = received;
 			if (this.#http) {
+				// A paced long request that cannot keep up with playback hands the
+				// rest of the window back to parallel ranges.
+				const paced = pending.find((p) => p.long);
+				slowTicks = paced && source.buffered(pos) < targets.ahead / 2 && httpRate * MiB < 1.2 * targets.rate ? slowTicks + 1 : 0;
+				if (paced && slowTicks >= 3) {
+					slowTicks = 0;
+					paced.long = false;
+					paced.to = Math.min(paced.to, paced.next + HTTP_CHUNK);
+					log(`delivery ${httpRate.toFixed(2)} MiB/s cannot keep up on one connection: parallel ranges`);
+				}
 				laneTicks++;
 				if (this.#http.throttled > lastThrottled) {
 					if (laneTarget > 1) log('server throttled (HTTP 429): back to one connection');

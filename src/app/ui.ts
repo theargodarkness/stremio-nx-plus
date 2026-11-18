@@ -52,7 +52,7 @@ export interface ListRow {
 
 /** A keyboard prompt in progress: the UI draws the text field above the keyboard. */
 export interface KeyboardState {
-	kind: 'search' | 'text';
+	kind: 'search' | 'text' | 'password';
 	label: string;
 	text: string;
 	cursor: number;
@@ -121,6 +121,10 @@ export interface UiServices {
 	promptText(ok: string, initial: string, onInput?: (text: string, cursor: number, keyboardHeight: number) => void): Promise<string | null>;
 	/** Resolves once the meta item is known; streams from slower add-ons follow through `onUpdate`. */
 	loadDetails(item: MetaPreview, videoId?: string, onUpdate?: (details: MetaDetails) => void): Promise<MetaDetails>;
+	/** Stremio account (absent where sign-in is unavailable, e.g. host tests). */
+	account?(): { email: string } | null;
+	signIn?(email: string, password: string): Promise<void>;
+	signOut?(): Promise<void>;
 	/** The console's clock is behind this build's date: HTTPS will fail until it is set. */
 	clockWrong?(): boolean;
 	/** Persisted settings (defaults when absent, e.g. in host tests). */
@@ -303,7 +307,7 @@ export class UiModel {
 			default:
 				if (this.keyboard) return '';
 				if (this.section === 'search') return this.railFocused ? 'A select   L/R sections' : 'Y new search   A open   B rail   L/R sections';
-				if (this.section === 'settings') return this.resetConfirm ? 'A confirm reset   B cancel' : '◀ ▶ change   A select   B rail   L/R sections';
+				if (this.section === 'settings') return this.resetConfirm ? 'A confirm   B cancel' : '◀ ▶ change   A select   B rail   L/R sections';
 				if (this.section === 'addons') return this.addonConfirm ? 'A confirm removal   B cancel' : 'Y install link   A remove selected   L/R sections';
 				return 'A open   Y search   L/R sections   + exit';
 		}
@@ -379,7 +383,8 @@ export class UiModel {
 
 	/** Settings rows for the renderer. */
 	settingRows(): SettingRow[] {
-		return SETTING_ITEMS.map((item) => ({ label: item.label, value: settingValueLabel(item, this.#settings), help: item.help, kind: item.kind }));
+		return SETTING_ITEMS.map((item) => ({ label: item.label, help: item.help, kind: item.kind,
+			value: item.kind === 'action' && item.id === 'account' ? this.#services.account?.()?.email ?? 'Sign in' : settingValueLabel(item, this.#settings) }));
 	}
 
 	focusedCard(): Card | undefined {
@@ -533,12 +538,19 @@ export class UiModel {
 	addons(): Addon[] { return this.#services.addons(); }
 	addonSetup(): { url: string; code: string } { return this.#services.addonSetup(); }
 	addonsChanged(): void {
-		for (const section of ['home', 'discover', 'search'] as const) this.sections[section].loaded = false;
+		for (const section of ['home', 'discover', 'library', 'search'] as const) this.sections[section].loaded = false;
 		this.#boardToken++;
 		this.#searchToken++;
 		this.addonCursor = Math.max(0, Math.min(this.addonCursor, this.addons().length - 1));
 		this.addonConfirm = undefined;
 		this.#touch();
+	}
+
+	/** The library changed underneath (account sync): refresh Continue Watching if Home is showing. */
+	libraryChanged(): void {
+		this.sections.library.loaded = false;
+		this.sections.home.loaded = false;
+		if (this.screen === 'section' && this.section === 'home' && !this.busy && !this.keyboard) void this.#enterSection('home');
 	}
 
 	openTracks(kind: 'audio' | 'subtitles'): void {
@@ -686,6 +698,7 @@ export class UiModel {
 			this.message = value.trim() ? 'Excluded words saved.' : 'Excluded words cleared.';
 			return this.#touch();
 		}
+		if (item.id === 'account') return this.#accountAction();
 		if (!this.resetConfirm) {
 			this.resetConfirm = true;
 			this.message = 'Reset every setting to the defaults? A confirms · B cancels';
@@ -695,6 +708,36 @@ export class UiModel {
 		this.updateSettings({ ...DEFAULT_SETTINGS });
 		this.message = 'Settings reset to defaults.';
 		this.#touch();
+	}
+
+	/** Sign in (email, then password) or, when signed in, sign out after a second press. */
+	async #accountAction(): Promise<void> {
+		const { account, signIn, signOut } = this.#services;
+		if (!account || !signIn || !signOut) { this.message = 'Account sign-in is not available here.'; return this.#touch(); }
+		const current = account();
+		if (current) {
+			if (!this.resetConfirm) {
+				this.resetConfirm = true;
+				this.message = `Sign out of ${current.email}? A confirms · B cancels`;
+				return this.#touch();
+			}
+			this.resetConfirm = false;
+			await this.#run('Signing out…', async () => {
+				await signOut();
+				this.addonsChanged();
+				this.message = 'Signed out. The add-ons installed on this console are back.';
+			});
+			return;
+		}
+		const email = (await this.#prompt({ kind: 'text', label: 'Stremio account: email', ok: 'Next', initial: '', placeholder: 'you@example.com' }))?.trim();
+		if (!email) return;
+		const password = await this.#prompt({ kind: 'password', label: `Password for ${email}`, ok: 'Sign in', initial: '' });
+		if (!password) return;
+		await this.#run('Signing in…', async () => {
+			await signIn(email, password);
+			this.addonsChanged();
+			this.message = `Signed in as ${email}. Home now shows your account's Continue Watching and add-ons.`;
+		});
 	}
 
 	#toggleHidden(): void {

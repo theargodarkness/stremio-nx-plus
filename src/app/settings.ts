@@ -63,11 +63,12 @@ type Choice<T> = { value: T; label: string };
 export type SettingItem =
 	| { kind: 'choice'; key: keyof Settings; label: string; help: string; choices: Choice<unknown>[] }
 	| { kind: 'text'; key: 'excludeKeywords'; label: string; help: string; placeholder: string }
-	| { kind: 'action'; id: 'reset'; label: string; help: string };
+	| { kind: 'action'; id: 'reset' | 'account'; label: string; help: string };
 
 const onOff: Choice<boolean>[] = [{ value: true, label: 'On' }, { value: false, label: 'Off' }];
 
 export const SETTING_ITEMS: SettingItem[] = [
+	{ kind: 'action', id: 'account', label: 'Stremio account', help: 'Sign in to bring your watch history, Continue Watching and library from your Stremio account, and keep them in sync. Your account\'s add-ons replace the ones installed here. Sign-in uses email and password.' },
 	{ kind: 'choice', key: 'maxResolution', label: 'Maximum resolution', help: 'Hides streams above this. 4K stutters on the Switch; 1080p is the sweet spot docked or handheld.',
 		choices: RESOLUTIONS.map((value) => ({ value, label: value === 0 ? 'Any' : value === 2160 ? '4K' : `${value}p` })) },
 	{ kind: 'choice', key: 'hideHdr', label: 'Hide HDR', help: 'HDR10, HDR10+ and HLG. There is no HDR tone mapping, so these look washed out.', choices: onOff },

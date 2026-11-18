@@ -363,13 +363,15 @@ test('settings: cycle, edit words, reset; changes persist and the stream list fo
 	const ui = new UiModel(services); await settle();
 	ui.press('l');
 	assert.equal(ui.section, 'settings');
-	assert.equal(ui.settingRows()[0].value, '1080p');
+	assert.deepEqual([ui.settingRows()[0].label, ui.settingRows()[0].value], ['Stremio account', 'Sign in']);
+	ui.press('down'); // past the account row, onto Maximum resolution
+	assert.equal(ui.settingRows()[1].value, '1080p');
 	ui.press('left'); // 1080p -> 1440p
 	ui.press('left'); // -> 4K
-	assert.equal(ui.settingRows()[0].value, '4K');
+	assert.equal(ui.settingRows()[1].value, '4K');
 	assert.equal(saved.at(-1)?.maxResolution, 2160);
 	const wordsIndex = ui.settingRows().findIndex((r) => r.kind === 'text');
-	for (let i = 0; i < wordsIndex; i++) ui.press('down');
+	for (let i = 1; i < wordsIndex; i++) ui.press('down');
 	ui.press('a'); await settle();
 	assert.equal(saved.at(-1)?.excludeKeywords, 'x264, cam');
 	assert.equal(ui.settingRows()[wordsIndex].value, 'x264, cam');
@@ -385,7 +387,7 @@ test('settings: cycle, edit words, reset; changes persist and the stream list fo
 	assert.equal(ui.resetConfirm, true);
 	ui.press('a');
 	assert.deepEqual(saved.at(-1), DEFAULT_SETTINGS);
-	assert.equal(ui.settingRows()[0].value, '1080p');
+	assert.equal(ui.settingRows()[1].value, '1080p');
 	ui.press('b');
 	assert.equal(ui.railFocused, true, 'B leaves the settings list for the rail');
 });
@@ -700,4 +702,51 @@ test('a wrong console clock is named when no catalog loads', async () => {
 	const { services } = fake([], { continueWatching: () => [], loadBoard: async () => [], clockWrong: () => true });
 	const ui = new UiModel(services); await settle();
 	assert.match(ui.message, /date and time are wrong/);
+});
+
+// ---- Stremio account ----
+
+test('sign in asks for email then a masked password; sign out needs a second press', async () => {
+	const kb = keyboardFake();
+	const calls: string[] = [];
+	let signedIn: { email: string } | null = null;
+	const { services } = fake(calls, {
+		promptText: kb.promptText,
+		account: () => signedIn,
+		signIn: async (email, password) => { if (password !== 'right') throw new Error('Wrong email or password.'); signedIn = { email }; calls.push(`signin ${email}`); },
+		signOut: async () => { signedIn = null; calls.push('signout'); },
+	});
+	const ui = new UiModel(services); await settle();
+	ui.press('l'); // settings, cursor on the account row
+	ui.press('a'); await settle();
+	assert.equal(ui.keyboard?.kind, 'text');
+	kb.submit(' me@example.com '); await settle();
+	assert.equal(ui.keyboard?.kind, 'password', 'the password field is masked by its kind');
+	assert.equal(ui.keyboard?.label, 'Password for me@example.com');
+	kb.submit('wrong'); await settle(); await settle();
+	assert.equal(ui.message, 'Failed: Wrong email or password.');
+	assert.equal(ui.settingRows()[0].value, 'Sign in');
+	ui.press('a'); await settle(); kb.submit('me@example.com'); await settle(); kb.submit('right'); await settle(); await settle();
+	assert.ok(calls.includes('signin me@example.com'));
+	assert.equal(ui.settingRows()[0].value, 'me@example.com');
+	assert.match(ui.message, /Signed in as me@example.com/);
+	assert.equal(ui.sections.home.loaded, false, 'home reloads with the account\'s add-ons and history');
+	ui.press('a'); await settle();
+	assert.match(ui.message, /Sign out of me@example.com\?/);
+	assert.ok(!calls.includes('signout'));
+	ui.press('a'); await settle(); await settle();
+	assert.ok(calls.includes('signout'));
+	assert.equal(ui.settingRows()[0].value, 'Sign in');
+});
+
+test('cancelling either prompt signs nobody in', async () => {
+	const kb = keyboardFake();
+	const calls: string[] = [];
+	const { services } = fake(calls, { promptText: kb.promptText, account: () => null, signIn: async () => { calls.push('signin'); }, signOut: async () => {} });
+	const ui = new UiModel(services); await settle();
+	ui.press('l'); ui.press('a'); await settle();
+	kb.cancel(); await settle();
+	assert.equal(ui.keyboard, undefined);
+	ui.press('a'); await settle(); kb.submit('me@example.com'); await settle(); kb.cancel(); await settle();
+	assert.deepEqual(calls.filter((c) => c === 'signin'), []);
 });
