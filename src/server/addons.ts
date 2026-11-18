@@ -9,6 +9,10 @@ export interface AddonSetup {
 	remove(url: string): Promise<void>;
 	changed(): void;
 	external?(): string | undefined;
+	/** Stremio account sign-in from the paired phone (its keyboard instead of the console's). */
+	account?(): string | null;
+	signIn?(email: string, password: string): Promise<void>;
+	signOut?(): Promise<void>;
 }
 
 /** Paired phone access for add-on management and selected external service links. */
@@ -28,39 +32,54 @@ export function createAddonHandler(setup: AddonSetup): HttpHandler {
 		if (req.headers.get('origin') !== origin || !req.headers.get('content-type')?.startsWith('application/json')) return text(403, 'Open the setup page first.');
 		if (req.body.length > 12 * 1024) return text(400, 'Request too large');
 		if (Date.now() < retryAt) return json(429, { error: 'Too many incorrect codes. Wait one minute.' });
-		let body: { code?: unknown; action?: unknown; url?: unknown };
+		let body: { code?: unknown; action?: unknown; url?: unknown; email?: unknown; password?: unknown };
 		try { body = JSON.parse(new TextDecoder().decode(req.body)); } catch { return json(400, { error: 'Invalid request.' }); }
 		if (!body || body.code !== setup.code) {
 			if (++failures >= 5) { retryAt = Date.now() + 60000; failures = 0; }
 			return json(403, { error: 'Enter the pairing code shown on the Switch.' });
 		}
 		failures = 0;
-		if (!['list', 'install', 'remove'].includes(String(body.action))) return json(400, { error: 'Unknown action.' });
-		if (changing) return json(409, { error: 'An add-on change is in progress. Try again shortly.' });
+		const accountAction = body.action === 'signin' || body.action === 'signout';
+		if (accountAction && !(setup.account && setup.signIn && setup.signOut)) return json(400, { error: 'Account sign-in is not available.' });
+		if (!accountAction && !['list', 'install', 'remove'].includes(String(body.action))) return json(400, { error: 'Unknown action.' });
+		if (changing) return json(409, { error: 'A change is in progress. Try again shortly.' });
 		try {
-			if (body.action !== 'list') {
+			if (body.action === 'signin') {
+				if (typeof body.email !== 'string' || typeof body.password !== 'string' || !body.email.trim() || !body.password || body.email.length > 254 || body.password.length > 1024) return json(400, { error: 'Enter your email and password.' });
+				changing = true;
+				await setup.signIn!(body.email.trim(), body.password);
+				setup.changed();
+			} else if (body.action === 'signout') {
+				changing = true;
+				await setup.signOut!();
+				setup.changed();
+			} else if (body.action !== 'list') {
 				if (typeof body.url !== 'string') return json(400, { error: 'Enter an add-on install link.' });
 				changing = true;
 				if (body.action === 'install') await setup.install(body.url);
 				else await setup.remove(body.url);
 				setup.changed();
 			}
-			return json(200, { external: setup.external?.(), addons: setup.list().map(a => ({ url: a.transportUrl, name: a.manifest.name, version: a.manifest.version, protected: !!a.flags?.protected })) });
+			return json(200, { external: setup.external?.(), account: setup.account?.() ?? null, canSignIn: !!setup.signIn, addons: setup.list().map(a => ({ url: a.transportUrl, name: a.manifest.name, version: a.manifest.version, protected: !!a.flags?.protected })) });
 		} catch (error) {
-			return json(400, { error: error instanceof Error ? error.message : 'Add-on change failed.' });
+			return json(400, { error: error instanceof Error ? error.message : 'The change failed.' });
 		} finally { changing = false; }
 	};
 }
 
-const PAGE = `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Stremio NX add-ons</title>
+const PAGE = `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Stremio NX</title>
 <style>body{font:17px system-ui;background:#0f0d1f;color:#fff;max-width:660px;margin:40px auto;padding:0 20px}input,button{font:inherit;padding:12px;border-radius:8px;border:1px solid #655a91;margin:6px 0}input{box-sizing:border-box;width:100%;background:#211c36;color:#fff}button{background:#7551de;color:white;cursor:pointer}li{margin:18px 0}p{line-height:1.5}#status{white-space:pre-wrap;color:#d7ccff}button:disabled{opacity:.5}</style>
-<h1>Stremio NX add-ons</h1><p>Keep Stremio NX open on your Switch. Both devices must use the same Wi-Fi network.</p>
+<h1>Stremio NX</h1><p>Keep Stremio NX open on your Switch. Both devices must use the same Wi-Fi network.</p>
 <form id="pair"><label for="code">Pairing code shown on the Switch</label><input id="code" autocomplete="off" maxlength="8" required><button>Connect</button></form>
-<section id="manage" hidden><h2>Selected service link</h2><p>Choose an “open on phone” source on the Switch, then refresh here. Playback opens on this device and may require your provider's app or subscription.</p><button id="refresh" type="button">Refresh selected link</button><p><a id="external" hidden target="_blank" rel="noopener noreferrer" style="color:#d7ccff">Open service</a></p><h2>Install an add-on</h2><p>Open the add-on's website on this device and finish its configuration. Copy its <strong>Install</strong> link and paste it below. Both <strong>stremio://</strong> links and HTTP(S) manifest links work. If Install opens another app, press and hold or right-click the button to copy its link.</p>
+<section id="manage" hidden><section id="acct" hidden><h2>Stremio account</h2><p id="acctState"></p>
+<form id="signin"><label for="email">Email</label><input id="email" type="email" autocomplete="username" autocapitalize="off" spellcheck="false" required><label for="password">Password</label><input id="password" type="password" autocomplete="current-password" required><button>Sign in on Switch</button><p>Your password goes to your Switch over this Wi-Fi network without encryption, and from there to Stremio encrypted. Use a network you trust. It is not stored.</p></form>
+<button id="signout" type="button" hidden>Sign out on Switch</button></section><h2>Selected service link</h2><p>Choose an “open on phone” source on the Switch, then refresh here. Playback opens on this device and may require your provider's app or subscription.</p><button id="refresh" type="button">Refresh selected link</button><p><a id="external" hidden target="_blank" rel="noopener noreferrer" style="color:#d7ccff">Open service</a></p><h2>Install an add-on</h2><p>Open the add-on's website on this device and finish its configuration. Copy its <strong>Install</strong> link and paste it below. Both <strong>stremio://</strong> links and HTTP(S) manifest links work. If Install opens another app, press and hold or right-click the button to copy its link.</p>
 <form id="install"><label for="url">Configured add-on install link</label><input id="url" type="text" autocapitalize="off" spellcheck="false" placeholder="https://example.com/manifest.json" required><button>Install on Switch</button></form><h2>Installed add-ons</h2><ul id="addons"></ul></section><p id="status" role="status" aria-live="polite"></p>
 <script>
 const $=id=>document.getElementById(id);let busy=false;
-async function request(action,url){if(busy)return;busy=true;document.querySelectorAll('button').forEach(b=>b.disabled=true);$('status').textContent='Working…';try{const response=await fetch('/api/addons',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code:$('code').value.trim().toUpperCase(),action,url})});const data=await response.json();if(!response.ok)throw Error(data.error||'Request failed.');$('manage').hidden=false;$('external').hidden=true;$('external').removeAttribute('href');if(data.external){const link=new URL(data.external);if(['https:','http:'].includes(link.protocol)&&!link.username&&!link.password){$('external').href=link.href;$('external').textContent='Open '+link.hostname;$('external').hidden=false}}$('addons').replaceChildren();for(const addon of data.addons){const li=document.createElement('li');const name=document.createElement('span');name.textContent=addon.name+' · '+addon.version+' ';li.append(name);if(!addon.protected){const button=document.createElement('button');button.textContent='Remove';button.onclick=()=>{if(confirm('Remove '+addon.name+'?'))request('remove',addon.url)};li.append(button)}$('addons').append(li)}$('status').textContent=action==='list'?'Connected.':action==='install'?'Installed on your Switch.':'Add-on removed.';if(action==='install')$('url').value='';}catch(e){$('status').textContent=e.message}finally{busy=false;document.querySelectorAll('button').forEach(b=>b.disabled=false)}}
+async function request(action,url,extra){if(busy)return;busy=true;document.querySelectorAll('button').forEach(b=>b.disabled=true);$('status').textContent='Working…';try{const response=await fetch('/api/addons',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.assign({code:$('code').value.trim().toUpperCase(),action,url},extra))});const data=await response.json();if(!response.ok)throw Error(data.error||'Request failed.');$('manage').hidden=false;$('acct').hidden=!data.canSignIn;$('signin').hidden=!!data.account;$('signout').hidden=!data.account;$('acctState').textContent=data.account?'Signed in as '+data.account+'. Continue Watching and your library sync with this account.':'Sign in to sync Continue Watching and your library. The add-ons of your account replace the ones installed on the Switch.';$('password').value='';$('external').hidden=true;$('external').removeAttribute('href');if(data.external){const link=new URL(data.external);if(['https:','http:'].includes(link.protocol)&&!link.username&&!link.password){$('external').href=link.href;$('external').textContent='Open '+link.hostname;$('external').hidden=false}}$('addons').replaceChildren();for(const addon of data.addons){const li=document.createElement('li');const name=document.createElement('span');name.textContent=addon.name+' · '+addon.version+' ';li.append(name);if(!addon.protected){const button=document.createElement('button');button.textContent='Remove';button.onclick=()=>{if(confirm('Remove '+addon.name+'?'))request('remove',addon.url)};li.append(button)}$('addons').append(li)}$('status').textContent=action==='list'?'Connected.':action==='install'?'Installed on your Switch.':action==='signin'?'Signed in on your Switch.':action==='signout'?'Signed out on your Switch.':'Add-on removed.';if(action==='install')$('url').value='';}catch(e){$('status').textContent=e.message}finally{busy=false;document.querySelectorAll('button').forEach(b=>b.disabled=false)}}
 $('pair').onsubmit=e=>{e.preventDefault();request('list')};$('install').onsubmit=e=>{e.preventDefault();request('install',$('url').value)};
 $('refresh').onclick=()=>request('list');
+const scanned=new URLSearchParams(location.search).get('code');if(scanned){$('code').value=scanned.slice(0,8);history.replaceState(null,'','/');request('list')}
+$('signin').onsubmit=e=>{e.preventDefault();request('signin',undefined,{email:$('email').value,password:$('password').value})};$('signout').onclick=()=>{if(confirm('Sign out on the Switch?'))request('signout')};
 </script></html>`;

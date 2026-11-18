@@ -711,59 +711,72 @@ function accountFake(calls: string[]) {
 	const box: { user: { email: string } | null } = { user: null };
 	const { services } = fake(calls, {
 		promptText: kb.promptText,
+		addonSetup: () => ({ url: 'http://192.168.1.20:11471', code: 'ABCD1234' }),
 		account: () => box.user,
 		signIn: async (email, password) => { if (password !== 'right') throw new Error('Wrong email or password.'); box.user = { email }; calls.push(`signin ${email}`); },
 		signOut: async () => { box.user = null; calls.push('signout'); },
 	});
-	return { kb, services };
+	return { kb, box, services };
 }
 
-test('sign in is two steps, each opened by its own A press; the password is a masked field', async () => {
+test('A on the account row shows a QR panel for the phone; it closes when the phone signs in', async () => {
 	const calls: string[] = [];
-	const { kb, services } = accountFake(calls);
+	const { kb, box, services } = accountFake(calls);
 	const ui = new UiModel(services); await settle();
 	ui.press('l'); // settings, cursor on the account row
 	ui.press('a'); await settle();
-	assert.equal(ui.keyboard?.kind, 'text');
-	kb.submit(' me@example.com '); await settle();
-	assert.equal(ui.keyboard, undefined, 'no second keyboard opens by itself');
-	assert.equal(kb.opened.length, 1);
-	assert.match(ui.message, /Press A again to enter your password/);
-	assert.equal(ui.settingRows()[0].value, 'me@example.com: press A for password');
-	ui.press('a'); await settle();
-	assert.equal(ui.keyboard?.kind, 'password');
-	assert.equal(ui.keyboard?.label, 'Password for me@example.com');
-	kb.type('wr');
-	assert.equal(ui.keyboard?.text.length, 2, 'typed characters reach the field');
-	kb.submit('wrong'); await settle(); await settle();
-	assert.equal(ui.message, 'Failed: Wrong email or password.');
-	ui.press('a'); await settle(); // straight back to the password: the email is kept
-	assert.equal(ui.keyboard?.kind, 'password');
-	kb.submit('right'); await settle(); await settle();
-	assert.ok(calls.includes('signin me@example.com'));
-	assert.equal(ui.settingRows()[0].value, 'me@example.com');
+	assert.deepEqual(ui.accountPanel, { link: 'http://192.168.1.20:11471/?code=ABCD1234', url: 'http://192.168.1.20:11471', code: 'ABCD1234' });
+	assert.equal(kb.opened.length, 0, 'no keyboard is needed');
+	assert.match(ui.hint(), /B close/);
+	for (const b of ['a', 'up', 'down', 'l', 'r', 'y'] as const) ui.press(b);
+	assert.ok(ui.accountPanel && ui.section === 'settings', 'the panel is modal');
+	// The phone page signs in (main.ts calls accountChanged).
+	box.user = { email: 'me@example.com' };
+	ui.accountChanged('me@example.com');
+	assert.equal(ui.accountPanel, undefined);
 	assert.match(ui.message, /Signed in as me@example.com/);
-	assert.equal(ui.sections.home.loaded, false, "home reloads with the account's add-ons and history");
+	assert.equal(ui.settingRows()[0].value, 'me@example.com');
 	ui.press('a'); await settle();
 	assert.match(ui.message, /Sign out of me@example.com\?/);
 	ui.press('a'); await settle(); await settle();
 	assert.ok(calls.includes('signout'));
-	assert.equal(ui.settingRows()[0].value, 'Sign in');
+	ui.press('a'); await settle();
+	ui.press('b');
+	assert.equal(ui.accountPanel, undefined, 'B closes the panel');
+	assert.equal(ui.railFocused, false);
 });
 
-test('B forgets the entered email; a dismissed prompt signs nobody in', async () => {
+test('X on the panel signs in with the Switch keyboard instead, in two steps', async () => {
 	const calls: string[] = [];
 	const { kb, services } = accountFake(calls);
 	const ui = new UiModel(services); await settle();
 	ui.press('l'); ui.press('a'); await settle();
-	kb.cancel(); await settle();
-	assert.equal(ui.accountEmail, undefined);
-	ui.press('a'); await settle(); kb.submit('me@example.com'); await settle();
+	ui.press('x'); await settle();
+	assert.equal(ui.accountPanel, undefined);
+	assert.equal(ui.keyboard?.kind, 'text');
+	kb.submit(' me@example.com '); await settle();
+	assert.equal(ui.keyboard, undefined, 'no second keyboard opens by itself');
+	assert.equal(ui.settingRows()[0].value, 'me@example.com: press A for password');
+	ui.press('a'); await settle();
+	assert.equal(ui.keyboard?.kind, 'password');
+	kb.submit('wrong'); await settle(); await settle();
+	assert.equal(ui.message, 'Failed: Wrong email or password.');
+	ui.press('a'); await settle();
+	kb.submit('right'); await settle(); await settle();
+	assert.ok(calls.includes('signin me@example.com'));
+	assert.equal(ui.settingRows()[0].value, 'me@example.com');
+});
+
+test('B forgets an email entered on the keyboard; a dismissed prompt signs nobody in', async () => {
+	const calls: string[] = [];
+	const { kb, services } = accountFake(calls);
+	const ui = new UiModel(services); await settle();
+	ui.press('l'); ui.press('a'); await settle(); ui.press('x'); await settle();
+	kb.submit('me@example.com'); await settle();
 	ui.press('a'); await settle(); kb.cancel(); await settle();
 	assert.match(ui.message, /No password entered/);
 	ui.press('b');
 	assert.equal(ui.accountEmail, undefined);
 	assert.equal(ui.message, 'Sign-in cancelled.');
-	assert.equal(ui.railFocused, false, 'B cancelled the sign-in, not the screen');
 	assert.deepEqual(calls.filter((c) => c.startsWith('signin')), []);
 });

@@ -1,6 +1,6 @@
 {
   "name": "stremio-nx",
-  "version": "0.7.2",
+  "version": "0.8.0",
   "private": true,
   "description": "Independent Stremio-compatible video player for Nintendo Switch homebrew",
   "author": "jrgf",
@@ -23,7 +23,8 @@
     "core-account": "esbuild --bundle --platform=node --target=node22 --format=esm --loader:.wasm=binary --outfile=host-test/dist/core-account.mjs host-test/core-account.ts && node host-test/dist/core-account.mjs"
   },
   "dependencies": {
-    "@stremio/stremio-core-web": "0.62.1"
+    "@stremio/stremio-core-web": "0.62.1",
+    "qrcode-generator": "^1.5.2"
   },
   "devDependencies": {
     "@nx.js/nro": "1.0.0-beta.6",

@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.8.0: QR sign-in
+
+### Added
+- **Sign in with your phone.** Settings > Stremio account shows a QR code. Scanning it opens the console's own page (the one used for add-on setup) with the pairing code filled in; email and password are typed on the phone, and the Switch signs in. The panel closes by itself. The address and pairing code are shown for phones without a camera app, and the page also signs out.
+- The password travels from the phone to the Switch over the local network unencrypted (the page says so), then to Stremio over HTTPS. It is not stored or logged.
+- X on the panel uses the Switch keyboard instead (email, then A again for the password).
+
+### Notes
+- The password prompt on the Switch keyboard did not receive key presses on hardware, for a reason not found from here; the keyboard log lines added in 0.7.2 remain to diagnose it. QR sign-in does not use the console keyboard.
+- New dependency: `qrcode-generator` (MIT).
+
+### Developer
+- The add-on page test parses the page's inline script and checks every element it looks up exists.
+
 ## 0.7.2: sign-in in two steps
 
 ### Fixed

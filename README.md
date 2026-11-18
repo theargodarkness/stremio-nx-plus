@@ -28,7 +28,7 @@ Browse catalogs and play torrents or direct HTTP links, including compatible deb
 
 ## Stremio account
 
-Settings > Stremio account signs in with your email and password. Home then shows your account's Continue Watching, the Library section your library, and what you watch here syncs back. Your account's add-ons replace the ones installed on the console while signed in. Accounts created with Facebook, Google or Apple need a password set on stremio.com first.
+Settings > Stremio account shows a QR code: scan it with a phone on the same Wi-Fi and enter your Stremio email and password there (X uses the Switch keyboard instead). Home then shows your account's Continue Watching, the Library section your library, and what you watch here syncs back. Your account's add-ons replace the ones installed on the console while signed in. Accounts created with Facebook, Google or Apple need a password set on stremio.com first.
 
 ## Subtitles
 

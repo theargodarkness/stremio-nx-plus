@@ -6,6 +6,7 @@
  */
 import type { HitTarget, Playback, Section, UiModel, Row } from './ui';
 import { SECTIONS as ALL_SECTIONS, SECTION_TITLES, videoLabel } from './ui';
+import { qrMatrix } from './qr';
 
 export const W = 1280;
 export const H = 720;
@@ -77,6 +78,10 @@ export function drawUi(ctx: CanvasRenderingContext2D, ui: UiModel, image: ImageL
 	if (ui.keyboard) {
 		hits.length = 0; // the keyboard owns input while it is open
 		drawKeyboardOverlay(ctx, ui);
+	} else if (ui.accountPanel) {
+		hits.length = 0;
+		hits.push({ x: 0, y: 0, w: W, h: H, target: { kind: 'back' } }); // a tap closes the panel
+		drawAccountPanel(ctx, ui.accountPanel);
 	}
 	return hits;
 }
@@ -609,6 +614,72 @@ function drawKeyboardOverlay(ctx: CanvasRenderingContext2D, ui: UiModel): void {
 	ctx.fillText(clip(ctx, k.label, w), x, 52);
 	// Passwords are never drawn: one mark per character.
 	drawTextField(ctx, x, 70, w, 58, k.kind === 'password' ? '*'.repeat(k.text.length) : k.text, k.placeholder ?? '', k.cursor, true, false);
+}
+
+/**
+ * Sign in from a phone: the QR code opens this console's sign-in page with
+ * the pairing code filled in. Dark modules on a white card with a quiet zone
+ * of four modules, as scanners expect.
+ */
+function drawAccountPanel(ctx: CanvasRenderingContext2D, panel: { link: string; url: string; code: string }): void {
+	ctx.fillStyle = COLOR.bg;
+	ctx.fillRect(0, 0, W, H - FOOTER_H);
+	ctx.fillStyle = COLOR.text;
+	ctx.font = 'bold 34px sans-serif';
+	ctx.fillText('Sign in with your phone', 96, 92);
+
+	const matrix = qrMatrix(panel.link);
+	const n = matrix.length;
+	const QUIET = 4;
+	const card = 420;
+	const cell = Math.floor(card / (n + 2 * QUIET));
+	const size = cell * (n + 2 * QUIET);
+	const cx = 96, cy = 140;
+	ctx.fillStyle = '#ffffff';
+	roundRect(ctx, cx, cy, size, size, 12);
+	ctx.fillStyle = '#000000';
+	for (let y = 0; y < n; y++) {
+		// One rectangle per run of dark modules in a row.
+		for (let x = 0; x < n; x++) {
+			if (!matrix[y][x]) continue;
+			let run = 1;
+			while (x + run < n && matrix[y][x + run]) run++;
+			ctx.fillRect(cx + (QUIET + x) * cell, cy + (QUIET + y) * cell, run * cell, cell);
+			x += run;
+		}
+	}
+
+	const tx = cx + size + 56;
+	const tw = W - tx - 72;
+	const steps = [
+		'1. Connect your phone to the same Wi-Fi as the Switch.',
+		'2. Scan the code with your phone\'s camera.',
+		'3. Enter your Stremio email and password on the phone.',
+	];
+	ctx.fillStyle = '#e6e2f7';
+	ctx.font = '22px sans-serif';
+	let y = cy + 34;
+	for (const step of steps) {
+		for (const line of wrap(ctx, step, tw, 2)) { ctx.fillText(line, tx, y); y += 30; }
+		y += 14;
+	}
+	ctx.fillStyle = COLOR.muted;
+	ctx.font = '18px sans-serif';
+	y += 10;
+	ctx.fillText('No camera? Open this address in a browser:', tx, y);
+	ctx.fillStyle = COLOR.text;
+	ctx.font = 'bold 24px sans-serif';
+	ctx.fillText(clip(ctx, panel.url, tw), tx, y + 36);
+	ctx.fillStyle = COLOR.muted;
+	ctx.font = '18px sans-serif';
+	ctx.fillText('Pairing code', tx, y + 78);
+	ctx.fillStyle = COLOR.text;
+	ctx.font = 'bold 30px sans-serif';
+	ctx.fillText(panel.code, tx, y + 114);
+	ctx.fillStyle = COLOR.muted;
+	ctx.font = '17px sans-serif';
+	wrap(ctx, 'This screen closes by itself once you are signed in. Your password is typed on the phone and sent to the Switch over your Wi-Fi.', tw, 3)
+		.forEach((line, i) => ctx.fillText(line, tx, y + 160 + i * 24));
 }
 
 // ---- settings ----

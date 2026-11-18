@@ -211,6 +211,8 @@ export class UiModel {
 	};
 	details?: DetailsState;
 	settingsCursor = 0;
+	/** The phone sign-in panel (QR code) is open: link to scan and the pairing code. */
+	accountPanel?: { link: string; url: string; code: string };
 	/** Sign-in in progress: the email entered, waiting for the password step. */
 	accountEmail?: string;
 	/** A search is waiting for add-ons (the body says so instead of "Press Y"). */
@@ -308,6 +310,7 @@ export class UiModel {
 			}
 			default:
 				if (this.keyboard) return '';
+				if (this.accountPanel) return 'B close   X use the Switch keyboard instead';
 				if (this.section === 'search') return this.railFocused ? 'A select   L/R sections' : 'Y new search   A open   B rail   L/R sections';
 				if (this.section === 'settings') return this.resetConfirm ? 'A confirm   B cancel' : '◀ ▶ change   A select   B rail   L/R sections';
 				if (this.section === 'addons') return this.addonConfirm ? 'A confirm removal   B cancel' : 'Y install link   A remove selected   L/R sections';
@@ -385,7 +388,10 @@ export class UiModel {
 
 	/** Settings rows for the renderer. */
 	settingRows(): SettingRow[] {
-		return SETTING_ITEMS.map((item) => ({ label: item.label, help: item.help, kind: item.kind,
+		const phone = this.#services.addonSetup();
+		const phoneHelp = /^http/.test(phone.url) ? ' Press A for a QR code to sign in from your phone.' : '';
+		return SETTING_ITEMS.map((item) => ({ label: item.label, kind: item.kind,
+			help: item.kind === 'action' && item.id === 'account' && !this.#services.account?.() ? `Sign in to sync Continue Watching and your library; your account's add-ons replace the ones here.${phoneHelp}` : item.help,
 			value: item.kind === 'action' && item.id === 'account'
 				? this.#services.account?.()?.email ?? (this.accountEmail ? `${this.accountEmail}: press A for password` : 'Sign in')
 				: settingValueLabel(item, this.#settings) }));
@@ -401,6 +407,12 @@ export class UiModel {
 	/** One button press. Async work runs in the background; `busy` gates input meanwhile. */
 	press(button: Button): void {
 		if (this.keyboard) return; // the keyboard has the controls
+		if (this.accountPanel) {
+			// The sign-in panel is modal: B closes, X switches to the console keyboard.
+			if (button === 'b') { this.accountPanel = undefined; this.#touch(); }
+			else if (button === 'x') { this.accountPanel = undefined; void this.#accountAction(true); }
+			return;
+		}
 		if (this.busy) {
 			if (button === 'b') this.#services.stop(); // abandon a pending load/connect
 			return;
@@ -418,6 +430,7 @@ export class UiModel {
 	/** Touch: something drawn was tapped. */
 	tap(target: HitTarget): void {
 		if (this.keyboard) return;
+		if (this.accountPanel) { this.accountPanel = undefined; return this.#touch(); }
 		if (target.kind === 'searchBar') { this.railFocused = false; void this.openSearch(); return; }
 		if (this.busy) return;
 		if (this.mediaMenu && !['tracks', 'trackRow', 'subtitleDelay', 'closeTracks'].includes(target.kind)) return;
@@ -547,6 +560,15 @@ export class UiModel {
 		this.#searchToken++;
 		this.addonCursor = Math.max(0, Math.min(this.addonCursor, this.addons().length - 1));
 		this.addonConfirm = undefined;
+		this.#touch();
+	}
+
+	/** Sign-in or sign-out happened on the phone page. */
+	accountChanged(email: string | null): void {
+		this.accountPanel = undefined;
+		this.accountEmail = undefined;
+		this.resetConfirm = false;
+		if (!this.busy && !this.keyboard && this.screen === 'section') this.message = email ? `Signed in as ${email}. Home now shows your account's Continue Watching and add-ons.` : 'Signed out.';
 		this.#touch();
 	}
 
@@ -716,7 +738,7 @@ export class UiModel {
 	}
 
 	/** Sign in (email, then password) or, when signed in, sign out after a second press. */
-	async #accountAction(): Promise<void> {
+	async #accountAction(viaKeyboard = false): Promise<void> {
 		const { account, signIn, signOut } = this.#services;
 		if (!account || !signIn || !signOut) { this.message = 'Account sign-in is not available here.'; return this.#touch(); }
 		const current = account();
@@ -734,8 +756,15 @@ export class UiModel {
 			});
 			return;
 		}
-		// Two steps, each started by its own A press: the console's keyboard does
-		// not take input when a second prompt opens straight after the first.
+		// Sign-in happens on the phone: a QR code opens this console's sign-in
+		// page with the pairing code filled in. X falls back to the keyboard.
+		const phone = this.#services.addonSetup();
+		if (!this.accountEmail && !viaKeyboard && /^http/.test(phone.url)) {
+			this.accountPanel = { link: `${phone.url}/?code=${encodeURIComponent(phone.code)}`, url: phone.url, code: phone.code };
+			this.message = '';
+			return this.#touch();
+		}
+		// Keyboard: two steps, each started by its own press.
 		if (!this.accountEmail) {
 			const email = (await this.#prompt({ kind: 'text', label: 'Stremio account: email', ok: 'OK', initial: '', placeholder: 'you@example.com' }))?.trim();
 			if (!email) return;
@@ -745,7 +774,11 @@ export class UiModel {
 		}
 		const email = this.accountEmail;
 		const password = await this.#prompt({ kind: 'password', label: `Password for ${email}`, ok: 'Sign in', initial: '' });
-		if (!password) { this.message = 'No password entered. Press A to try again, or B to change the email.'; return this.#touch(); }
+		if (!password) {
+			const phone = this.#services.addonSetup();
+			this.message = `No password entered. Press A to try again, or sign in from your phone: ${/^http/.test(phone.url) ? `${phone.url}, code ${phone.code}` : 'see Add-ons'}.`;
+			return this.#touch();
+		}
 		await this.#run('Signing in…', async () => {
 			await signIn(email, password);
 			this.accountEmail = undefined;

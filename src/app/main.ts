@@ -29,7 +29,7 @@ import { loadTrackPrefs, preferredTrack, saveTrackPrefs } from './track-prefs';
 /** No real clock reads earlier than this build; an earlier date means the console's clock is wrong. */
 const BUILD_EPOCH = Date.UTC(2026, 10, 1);
 
-const BUILD = 'stremio-nx build 0.7.2-signin-two-step-20261117';
+const BUILD = 'stremio-nx build 0.8.0-qr-signin-20261117';
 
 const CONTROL_PORT = 11470;
 const ADDON_PORT = 11471;
@@ -290,7 +290,10 @@ async function main(): Promise<void> {
 	let setupAvailable = false;
 	try {
 		const addonHandler = createAddonHandler({ origin: setupOrigin, code: pairingCode, list: () => core.addons(),
-			install: url => core.installAddon(url), remove: url => core.removeAddon(url), changed: () => state.ui?.addonsChanged(), external: () => externalLink });
+			install: url => core.installAddon(url), remove: url => core.removeAddon(url), changed: () => { state.ui?.addonsChanged(); state.ui?.libraryChanged(); }, external: () => externalLink,
+			account: () => core.account()?.email ?? null,
+			signIn: async (email, password) => { await core.signIn(email, password); log('account: signed in from the phone page'); state.ui?.accountChanged(email); },
+			signOut: async () => { await core.signOut(); log('account: signed out from the phone page'); state.ui?.accountChanged(null); } });
 		nxPlatform.listen(ADDON_PORT, conn => void serveConnection(conn, addonHandler), '0.0.0.0');
 		setupAvailable = true;
 		log(`add-on setup server on port ${ADDON_PORT}`);

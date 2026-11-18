@@ -62,5 +62,33 @@ test('configured links, bounded manifests, core persistence and paired add-on ma
 		assert.equal((await request({ code: '1234ABCD', action: 'remove', url: addon.transportUrl })).status, 200);
 		assert.equal(installed.length, 0);
 		assert.equal(changed, 2);
+
+		// Account sign-in from the paired phone.
+		let user: string | null = null;
+		const seen: string[] = [];
+		const withAccount = createAddonHandler({ origin: () => origin, code: '1234ABCD', list: () => [], install: async () => {}, remove: async () => {}, changed: () => { changed++; },
+			account: () => user,
+			signIn: async (email, password) => { seen.push(email); if (password !== 'right') throw new Error('Wrong email or password.'); user = email; },
+			signOut: async () => { user = null; } });
+		const post = async (body: unknown) => { const r = await withAccount({ method: 'POST', path: '/api/addons', query: new URLSearchParams(), headers: new Map([['host', '192.168.1.2:11471'], ['origin', origin], ['content-type', 'application/json']]), body: new TextEncoder().encode(JSON.stringify(body)) }); return { status: r.status, data: JSON.parse(new TextDecoder().decode(r.body as Uint8Array)) }; };
+		assert.equal((await post({ code: 'nope', action: 'signin', email: 'me@example.com', password: 'right' })).status, 403, 'sign-in needs the pairing code');
+		assert.deepEqual(seen, []);
+		assert.equal((await post({ code: '1234ABCD', action: 'signin', email: 'me@example.com' })).status, 400);
+		const wrong = await post({ code: '1234ABCD', action: 'signin', email: 'me@example.com', password: 'bad' });
+		assert.deepEqual([wrong.status, wrong.data.error], [400, 'Wrong email or password.']);
+		const listed = await post({ code: '1234ABCD', action: 'list' });
+		assert.deepEqual([listed.data.account, listed.data.canSignIn], [null, true]);
+		const ok = await post({ code: '1234ABCD', action: 'signin', email: ' me@example.com ', password: 'right' });
+		assert.deepEqual([ok.status, ok.data.account], [200, 'me@example.com']);
+		assert.ok(!JSON.stringify(ok.data).includes('right'), 'the password is never echoed');
+		assert.equal((await post({ code: '1234ABCD', action: 'signout' })).data.account, null);
+		assert.equal((await request({ code: '1234ABCD', action: 'signin', email: 'a@b.c', password: 'x' })).status, 400, 'unavailable where the app does not offer it');
+		const page = await withAccount({ method: 'GET', path: '/', query: new URLSearchParams('code=1234ABCD'), headers: new Map([['host', '192.168.1.2:11471']]), body: new Uint8Array() });
+		const html = new TextDecoder().decode(page.body as Uint8Array);
+		assert.ok(page.status === 200 && html.includes('type="password"') && html.includes("get('code')"), 'the page has the sign-in form and reads the scanned code');
+		// The page's inline script must parse, and every element it looks up must exist.
+		const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
+		assert.doesNotThrow(() => new Function(script), 'page script has a syntax error');
+		for (const [, id] of script.matchAll(/\$\('([A-Za-z]+)'\)/g)) assert.ok(html.includes(`id="${id}"`), `page element #${id} is missing`);
 	} finally { globalThis.fetch = originalFetch; }
 });
