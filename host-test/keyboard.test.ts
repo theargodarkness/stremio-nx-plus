@@ -133,13 +133,14 @@ test('typed text, caret moves and the keyboard height reach the UI as they happe
 
 /**
  * The console keyboard as it behaved on hardware: shown within a moment of
- * closing, it appears but accepts nothing. And like the runtime, every
- * show() starts an update loop that OK/cancel leave running until hide().
+ * closing, it appears but accepts nothing.
  */
 class RealisticKeyboard extends FakeKeyboard {
-	closedAt = -Infinity; dead = false; loops = 0; shows = 0;
-	show() { this.shows++; this.loops++; this.dead = Date.now() - this.closedAt < 40; super.show(); }
-	hide() { this.loops = 0; }
+	closedAt = -Infinity; dead = false; shows = 0; updatesStopped = false;
+	// Dead when reopened too soon, or when its per-frame update was stopped (hide())
+	// before the close finished: both left the keyboard visible but deaf on the console.
+	show() { this.shows++; this.dead = Date.now() - this.closedAt < 40 || this.updatesStopped; super.show(); }
+	hide() { this.updatesStopped = true; }
 	type(text: string) { if (!this.dead) super.type(text); }
 	submit(text: string) { this.closedAt = Date.now(); if (this.dead) { this.cancel(); return; } super.submit(text); }
 	cancel() { this.closedAt = Date.now(); super.cancel(); }
@@ -162,7 +163,7 @@ test('a second prompt right after the first waits for the keyboard to close, the
 		await new Promise((r) => setTimeout(r, 90));
 		assert.equal(kb.shows, 2);
 		assert.equal(kb.dead, false, 'opened after the gap: it accepts input');
-		assert.equal(kb.loops, 1, "the first prompt's leftover update loop was stopped");
+		assert.equal(kb.updatesStopped, false, 'the keyboard update keeps running between prompts so the close can finish');
 		kb.type('hunter2');
 		kb.submit('hunter2');
 		assert.equal(await password, 'hunter2');

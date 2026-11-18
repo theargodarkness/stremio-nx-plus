@@ -1,6 +1,6 @@
 {
   "name": "stremio-nx",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "private": true,
   "description": "Independent Stremio-compatible video player for Nintendo Switch homebrew",
   "author": "jrgf",

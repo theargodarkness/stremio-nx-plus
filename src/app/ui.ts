@@ -211,6 +211,8 @@ export class UiModel {
 	};
 	details?: DetailsState;
 	settingsCursor = 0;
+	/** Sign-in in progress: the email entered, waiting for the password step. */
+	accountEmail?: string;
 	/** A search is waiting for add-ons (the body says so instead of "Press Y"). */
 	searching = false;
 	/** Open keyboard prompt; all pad and touch input belongs to the keyboard meanwhile. */
@@ -384,7 +386,9 @@ export class UiModel {
 	/** Settings rows for the renderer. */
 	settingRows(): SettingRow[] {
 		return SETTING_ITEMS.map((item) => ({ label: item.label, help: item.help, kind: item.kind,
-			value: item.kind === 'action' && item.id === 'account' ? this.#services.account?.()?.email ?? 'Sign in' : settingValueLabel(item, this.#settings) }));
+			value: item.kind === 'action' && item.id === 'account'
+				? this.#services.account?.()?.email ?? (this.accountEmail ? `${this.accountEmail}: press A for password` : 'Sign in')
+				: settingValueLabel(item, this.#settings) }));
 	}
 
 	focusedCard(): Card | undefined {
@@ -673,6 +677,7 @@ export class UiModel {
 				return void this.#activateSetting();
 			case 'b':
 				if (this.resetConfirm) { this.resetConfirm = false; this.message = ''; return this.#touch(); }
+				if (this.accountEmail && SETTING_ITEMS[this.settingsCursor]?.kind === 'action') { this.accountEmail = undefined; this.message = 'Sign-in cancelled.'; return this.#touch(); }
 				this.railFocused = true;
 				this.railIndex = SECTIONS.indexOf(this.section);
 				return this.#touch();
@@ -729,12 +734,21 @@ export class UiModel {
 			});
 			return;
 		}
-		const email = (await this.#prompt({ kind: 'text', label: 'Stremio account: email', ok: 'Next', initial: '', placeholder: 'you@example.com' }))?.trim();
-		if (!email) return;
+		// Two steps, each started by its own A press: the console's keyboard does
+		// not take input when a second prompt opens straight after the first.
+		if (!this.accountEmail) {
+			const email = (await this.#prompt({ kind: 'text', label: 'Stremio account: email', ok: 'OK', initial: '', placeholder: 'you@example.com' }))?.trim();
+			if (!email) return;
+			this.accountEmail = email;
+			this.message = `Email set to ${email}. Press A again to enter your password (B starts over).`;
+			return this.#touch();
+		}
+		const email = this.accountEmail;
 		const password = await this.#prompt({ kind: 'password', label: `Password for ${email}`, ok: 'Sign in', initial: '' });
-		if (!password) return;
+		if (!password) { this.message = 'No password entered. Press A to try again, or B to change the email.'; return this.#touch(); }
 		await this.#run('Signing in…', async () => {
 			await signIn(email, password);
+			this.accountEmail = undefined;
 			this.addonsChanged();
 			this.message = `Signed in as ${email}. Home now shows your account's Continue Watching and add-ons.`;
 		});

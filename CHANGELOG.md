@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.2: sign-in in two steps
+
+### Fixed
+- **The password keyboard appeared but took no input.** 0.7.1 stopped the runtime's per-frame keyboard update after each prompt; closing the keyboard is a handshake that only advances while that update runs, so the next keyboard came up deaf. The update is left running again.
+- Sign-in no longer opens the password keyboard by itself after the email. Enter the email, then press A again for the password, so each keyboard opens on a button press of its own (as a second search does). The email is kept between attempts; B on the row starts over.
+- The log records how each keyboard closed and how many input events it delivered (never the text), to diagnose an unresponsive keyboard.
+
 ## 0.7.1: sign-in keyboard fix
 
 ### Fixed

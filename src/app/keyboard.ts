@@ -12,15 +12,17 @@
 /**
  * The console's keyboard needs a moment between closing and opening again:
  * shown in the same frame it was confirmed in, it comes up without accepting
- * input (two prompts in a row, such as email then password). The runtime
- * also leaves its per-frame keyboard update running after OK or cancel, and
- * a second copy starts with every show; `hide()` stops the stray one.
+ * input. Closing is a handshake with the keyboard applet that only advances
+ * while the runtime's per-frame keyboard update runs, so that update must
+ * NOT be stopped in between (the runtime leaves it running after OK or
+ * cancel; calling hide() there cancelled it and left the next keyboard
+ * visible but deaf). Flows that need two entries should open the second
+ * keyboard on a button press of its own rather than chaining prompts.
  */
 export const keyboardTiming = { reopenGapMs: 700 };
 let lastClosedAt = Number.NEGATIVE_INFINITY;
 
 export interface KeyboardLike {
-	hide?(): void;
 	value: string;
 	cursorIndex?: number;
 	maxLength?: number;
@@ -39,6 +41,7 @@ export function promptKeyboard(kb: KeyboardLike, title: string, initial: string,
 	onInput?: (text: string, cursor: number, height: number) => void): Promise<string | null> {
 	return new Promise((resolve) => {
 		let settled = false;
+		let events = 0;
 		const finish = (value: string | null) => {
 			if (settled) return;
 			settled = true;
@@ -47,17 +50,15 @@ export function promptKeyboard(kb: KeyboardLike, title: string, initial: string,
 			kb.removeEventListener('change', onChange);
 			kb.removeEventListener('cursormove', onChange);
 			clearTimeout(opening);
-			if (shown) {
-				lastClosedAt = Date.now();
-				// After this dispatch returns: stop the runtime's leftover update loop.
-				setTimeout(() => { try { kb.hide?.(); } catch { /* already hidden */ } }, 0);
-			}
+			if (shown) lastClosedAt = Date.now();
+			// Never the text: only what happened, to diagnose a keyboard that does not respond.
+			if (shown) log(`keyboard closed: ${value === null ? 'dismissed' : 'confirmed'} after ${events} input event${events === 1 ? '' : 's'}`);
 			onOpen(false);
 			resolve(value);
 		};
 		const onSubmit = () => finish(kb.value);
 		const report = () => onInput?.(kb.value, kb.cursorIndex ?? kb.value.length, kb.boundingRect.height);
-		const onChange = () => { if (!settled) report(); };
+		const onChange = () => { if (!settled) { events++; report(); } };
 		const onGeometry = () => {
 			// Hidden: a dismissal, unless the `submit` that follows OK arrives in this same dispatch.
 			if (kb.boundingRect.height === 0) void Promise.resolve().then(() => finish(null));
