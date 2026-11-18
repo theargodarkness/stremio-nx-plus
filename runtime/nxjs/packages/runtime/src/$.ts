@@ -860,7 +860,7 @@ export interface Init {
 	// video.cc — Video element (ffmpeg media pipeline)
 	videoNew(): VideoHandle;
 	videoSetRenderSize(video: VideoHandle, maxWidth: number, maxHeight: number): void;
-	videoFrameStats(video: VideoHandle): { width: number; height: number; transferMs: number; convertMs: number };
+	videoFrameStats(video: VideoHandle): { width: number; height: number; transferMs: number; convertMs: number; gpuConversion: boolean };
 	videoLoad(
 		video: VideoHandle,
 		path: string | null,
@@ -872,6 +872,7 @@ export interface Init {
 	videoTracks(video: VideoHandle, subtitle: boolean): VideoMediaTrack[];
 	videoSelectTrack(video: VideoHandle, id: number, subtitle: boolean): void;
 	videoSubtitleText(video: VideoHandle, seconds: number): string;
+	videoSetGpuConversion(video: VideoHandle, enabled: boolean): void;
 	videoSubtitleBitmap(
 		video: VideoHandle,
 		seconds: number,

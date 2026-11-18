@@ -329,8 +329,19 @@ export class Video extends EventTarget {
 		$.videoSetRenderSize(handleOf(this), maxWidth, maxHeight);
 	}
 
-	/** Presentation dimensions and peak transfer/conversion milliseconds since the last call. */
-	getFrameStats(): { width: number; height: number; transferMs: number; convertMs: number } {
+	/**
+	 * Convert colours on the GPU: frames reach the canvas as NV12 planes at
+	 * source size and are converted and scaled when drawn, so no CPU colour
+	 * conversion runs. Set before src. Used for sources up to 1080p on a
+	 * GPU-backed screen; otherwise the CPU path stays (see getFrameStats).
+	 */
+	setGpuConversion(enabled: boolean): void {
+		if (_(this).src) throw new DOMException('Set GPU conversion before src.', 'InvalidStateError');
+		$.videoSetGpuConversion(handleOf(this), !!enabled);
+	}
+
+	/** Presentation dimensions, peak transfer/conversion milliseconds since the last call, and whether the GPU converts colours. */
+	getFrameStats(): { width: number; height: number; transferMs: number; convertMs: number; gpuConversion: boolean } {
 		return $.videoFrameStats(handleOf(this));
 	}
 

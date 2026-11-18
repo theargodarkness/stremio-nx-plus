@@ -14,7 +14,7 @@ import type { CatalogRef, CatalogRow, MetaDetails, MetaItem, MetaPreview, Stream
 import type { Button } from './input';
 import type { Addon } from '../stremio/addons';
 import { streamKind } from '../stremio/streams';
-import { filterStreams, streamBadges, type FilterResult } from '../stremio/stream-info';
+import { filterStreams, pickNextStream, streamBadges, type FilterResult } from '../stremio/stream-info';
 import { DEFAULT_SETTINGS, SETTING_ITEMS, activeFilterCount, cycleSetting, sanitizeSettings, settingValueLabel, type SettingItem, type Settings } from './settings';
 
 export type Section = 'home' | 'discover' | 'library' | 'search' | 'addons' | 'settings';
@@ -87,9 +87,10 @@ export type HitTarget =
 	| { kind: 'settingStep'; index: number; step: 1 | -1 }
 	| { kind: 'toggleHidden' }
 	| { kind: 'searchBar' }
+	| { kind: 'season'; step: 1 | -1 }
 	| { kind: 'osdSeek'; fraction: number };
 
-export interface TrackOption { id: string; label: string; selected: boolean; enabled: boolean }
+export interface TrackOption { id: string; label: string; selected: boolean; enabled: boolean; language?: string }
 
 export interface Playback {
 	time: number;
@@ -120,11 +121,13 @@ export interface UiServices {
 	promptText(ok: string, initial: string, onInput?: (text: string, cursor: number, keyboardHeight: number) => void): Promise<string | null>;
 	/** Resolves once the meta item is known; streams from slower add-ons follow through `onUpdate`. */
 	loadDetails(item: MetaPreview, videoId?: string, onUpdate?: (details: MetaDetails) => void): Promise<MetaDetails>;
+	/** The console's clock is behind this build's date: HTTPS will fail until it is set. */
+	clockWrong?(): boolean;
 	/** Persisted settings (defaults when absent, e.g. in host tests). */
 	getSettings?(): Settings;
 	setSettings?(settings: Settings): void;
 	/** Start playing; resolves once playback has begun. `onProgress` updates the footer meanwhile. */
-	play(option: StreamOption, meta: MetaItem, videoId: string, onProgress: (message: string) => void): Promise<void>;
+	play(option: StreamOption, meta: MetaItem, videoId: string, onProgress: (message: string) => void): Promise<{ resumedAt?: number } | void>;
 	stop(): void;
 	togglePause(): void;
 	seekTo(seconds: number): void;
@@ -164,6 +167,11 @@ export interface DetailsState {
 	/** Stream add-ons still loading / failed for the current video. */
 	pendingAddons?: number;
 	failedAddons?: number;
+	/** Seasons of a series in display order (specials last) and the one listed. */
+	seasons?: number[];
+	season?: number;
+	/** The stream last played from this title (the next episode follows it). */
+	lastOption?: StreamOption;
 }
 
 export interface OsdState {
@@ -234,6 +242,9 @@ export class UiModel {
 	#lateStreams?: { token: number; videoId: string; details: MetaDetails };
 	#streamView?: { streams: StreamOption[]; version: number; showAll: boolean; result: FilterResult };
 	#listRows?: { source: object; rows: ListRow[] };
+	#episodes?: { videos: Video[]; season: number | undefined; list: Video[] };
+	/** A short message over the player controls (resume point, next episode). */
+	#notice?: { text: string; until: number; action?: 'restart' | 'next' };
 
 	constructor(services: UiServices, now: () => number = () => performance.now()) {
 		this.#services = services;
@@ -268,18 +279,23 @@ export class UiModel {
 				return SECTION_TITLES[this.section];
 			}
 			case 'details':
-			case 'player':
 				return this.details?.meta.name ?? '';
+			case 'player': {
+				// A series shows which episode is on.
+				const d = this.details;
+				const video = d?.videos.find((v) => v.id === d.videoId);
+				return video ? `${d!.meta.name}  ·  ${videoLabel(video)}` : d?.meta.name ?? '';
+			}
 		}
 	}
 
 	hint(): string {
 		switch (this.screen) {
 			case 'player':
-				return 'A pause   ◀ ▶ scrub   Y audio/subtitles   B back';
+				return `A pause   ◀ ▶ scrub   Y audio/subtitles${this.nextEpisode() ? '   R next episode' : ''}   B back`;
 			case 'details': {
 				const d = this.details;
-				if (d?.mode !== 'streams') return 'A select   B back';
+				if (d?.mode !== 'streams') return (d?.seasons?.length ?? 0) > 1 ? 'A select   ◀ ▶ season   B back' : 'A select   B back';
 				const view = this.streamView();
 				if (d.showAll) return `A play   X hide filtered streams   B back`;
 				return view.hidden > 0 ? `A play   X show ${view.hidden} hidden   B back` : 'A play   B back';
@@ -321,10 +337,10 @@ export class UiModel {
 	listRows(): ListRow[] {
 		const d = this.details;
 		if (!d) return [];
-		const source: object = d.mode === 'episodes' ? d.videos : this.streamView();
+		const source: object = d.mode === 'episodes' ? this.episodes() : this.streamView();
 		if (this.#listRows?.source === source) return this.#listRows.rows;
 		const rows: ListRow[] = d.mode === 'episodes'
-			? d.videos.map((v) => ({ label: videoLabel(v), detail: v.released?.slice(0, 10), enabled: true }))
+			? this.episodes().map((v) => ({ label: videoLabel(v), detail: episodeDetail(v), enabled: true }))
 			: this.streamView().rows.map(({ option, info, hiddenBy }) => ({
 				label: (info.text || `${option.stream.name ?? option.addonName}`.replace(/\s+/g, ' ')).slice(0, 160),
 				detail: hiddenBy ? `Hidden: ${hiddenBy}` : `${{ torrent: 'torrent', url: 'HTTP video', external: 'open on phone', unsupported: 'unsupported source' }[info.kind]} · ${option.addonName}`,
@@ -334,6 +350,31 @@ export class UiModel {
 			}));
 		this.#listRows = { source, rows };
 		return rows;
+	}
+
+	/** The episodes listed on the details screen: the chosen season of a series, or every video. */
+	episodes(): Video[] {
+		const d = this.details;
+		if (!d) return [];
+		const hit = this.#episodes;
+		if (hit && hit.videos === d.videos && hit.season === d.season) return hit.list;
+		const list = d.season === undefined ? d.videos : d.videos.filter((v) => (v.season ?? 0) === d.season);
+		this.#episodes = { videos: d.videos, season: d.season, list };
+		return list;
+	}
+
+	/** The episode after the one open or playing (specials and unreleased episodes are skipped). */
+	nextEpisode(): Video | undefined {
+		const d = this.details;
+		if (!d || d.videos.length === 0) return undefined;
+		const i = d.videos.findIndex((v) => v.id === d.videoId);
+		if (i < 0 || (d.videos[i].season ?? 0) === 0) return undefined;
+		return d.videos.slice(i + 1).find((v) => (v.season ?? 0) > 0 && !v.upcoming);
+	}
+
+	/** The message over the player controls, while it is current. */
+	playerNotice(): string {
+		return this.#notice && this.#now() < this.#notice.until ? this.#notice.text : '';
 	}
 
 	/** Settings rows for the renderer. */
@@ -383,6 +424,7 @@ export class UiModel {
 			case 'settingRow': this.settingsCursor = target.index; this.railFocused = false; void this.#activateSetting(); return;
 			case 'settingStep': this.settingsCursor = target.index; this.railFocused = false; return this.#stepSetting(target.step);
 			case 'toggleHidden': return this.#toggleHidden();
+			case 'season': return this.#stepSeason(target.step);
 			case 'rail':
 				void this.#enterSection(target.section);
 				return;
@@ -440,8 +482,9 @@ export class UiModel {
 				this.osd.hideAt = now + OSD_SHOW_MS;
 				changed = true;
 			}
+			if (this.#notice && now >= this.#notice.until) { this.#notice = undefined; changed = true; }
 			const buffering = p?.buffering ?? false;
-			const keep = !!this.mediaMenu || (p?.paused ?? false) || buffering || this.osd.scrubTarget !== undefined;
+			const keep = !!this.#notice || !!this.mediaMenu || (p?.paused ?? false) || buffering || this.osd.scrubTarget !== undefined;
 			if (buffering && !this.osd.visible) {
 				this.osd.visible = true;
 				changed = true;
@@ -455,9 +498,17 @@ export class UiModel {
 		return changed;
 	}
 
-	/** Leave the player (also called when the video ends). */
+	/** The video played to its end: continue the series, or go back to the title. */
+	playbackEnded(): void {
+		if (this.screen !== 'player') return;
+		if (this.#settings.autoplayNext && this.nextEpisode() && this.details?.lastOption) void this.#playNext();
+		else this.stopPlayback();
+	}
+
+	/** Leave the player. */
 	stopPlayback(): void {
 		if (this.screen !== 'player') return;
+		this.#notice = undefined;
 		this.#services.stop();
 		this.mediaMenu = undefined;
 		this.trackBusy = false;
@@ -740,11 +791,11 @@ export class UiModel {
 				};
 				try {
 					apply(await this.#services.loadBoard(apply));
-					if (token === this.#boardToken && this.message === loading) this.message = s.rows.length ? '' : 'No catalogs loaded. Check the connection or your add-ons.';
+					if (token === this.#boardToken && this.message === loading) this.message = s.rows.length ? '' : this.#services.clockWrong?.() ? friendlyError('certificate validity starts in the future') : 'No catalogs loaded. Check the connection or your add-ons.';
 				} catch (err) {
 					if (token !== this.#boardToken) return;
 					s.loaded = false;
-					this.message = `Failed: ${err instanceof Error ? err.message : String(err)}`;
+					this.message = friendlyError(err instanceof Error ? err.message : String(err));
 					this.#services.log(this.message);
 				}
 				this.#touch();
@@ -886,7 +937,7 @@ export class UiModel {
 			if (token === this.#searchToken) this.message = this.keyboard ? '' : rows.length === 0 ? `No results for “${q}”.` : this.message === searching ? '' : this.message;
 		} catch (err) {
 			if (token !== this.#searchToken) return;
-			this.message = `Failed: ${err instanceof Error ? err.message : String(err)}`;
+			this.message = friendlyError(err instanceof Error ? err.message : String(err));
 			this.#services.log(this.message);
 		} finally {
 			if (token === this.#searchToken) this.searching = false;
@@ -921,9 +972,15 @@ export class UiModel {
 		await this.#run(`Loading ${item.name}…`, async () => {
 			const details = await this.#services.loadDetails(item, undefined, (next) => this.#streamsArrived(token, item.id, next));
 			if (token !== this.#detailsToken) return;
-			const videos = details.meta.videos ?? [];
+			const videos = sortVideos(details.meta.videos ?? []);
+			// Seasons in order with specials (season 0) last; open on the season last watched.
+			const numbers = [...new Set(videos.map((v) => v.season ?? 0))].sort((a, b) => (a === 0 ? 1 : b === 0 ? -1 : a - b));
+			const seasons = videos.some((v) => v.season !== undefined) && numbers.length > 0 ? numbers : undefined;
+			const last = videos.find((v) => v.id === details.lastVideoId);
+			const season = seasons ? (last ? last.season ?? 0 : seasons[0]) : undefined;
 			this.details = { meta: details.meta, streams: details.streams, videos, mode: videos.length > 0 ? 'episodes' : 'streams', cursor: 0, videoId: item.id,
-				pendingAddons: details.pendingAddons ?? 0, failedAddons: details.failedAddons ?? 0 };
+				pendingAddons: details.pendingAddons ?? 0, failedAddons: details.failedAddons ?? 0, seasons, season };
+			if (last) this.details.cursor = Math.max(0, this.episodes().indexOf(last));
 			this.screen = 'details';
 			this.#applyLateStreams(token);
 		});
@@ -966,6 +1023,11 @@ export class UiModel {
 				d.cursor = (d.cursor + (button === 'up' ? -1 : 1) + rows.length) % rows.length;
 				return this.#touch();
 			}
+			case 'left':
+			case 'right':
+			case 'l':
+			case 'r':
+				return this.#stepSeason(button === 'left' || button === 'l' ? -1 : 1);
 			case 'a':
 				return void this.#activateListRow();
 			case 'x':
@@ -973,7 +1035,9 @@ export class UiModel {
 			case 'b':
 				if (d.mode === 'streams' && d.videos.length > 0) {
 					d.mode = 'episodes';
-					d.cursor = Math.max(0, d.videos.findIndex((v) => v.id === d.videoId));
+					const video = d.videos.find((v) => v.id === d.videoId);
+					if (video && d.seasons) d.season = video.season ?? 0;
+					d.cursor = Math.max(0, this.episodes().findIndex((v) => v.id === d.videoId));
 					return this.#touch();
 				}
 				this.screen = 'section';
@@ -986,7 +1050,7 @@ export class UiModel {
 		const d = this.details;
 		if (!d) return;
 		if (d.mode === 'episodes') {
-			const video = d.videos[d.cursor];
+			const video = this.episodes()[d.cursor];
 			if (!video) return;
 			const token = ++this.#detailsToken;
 			await this.#run(`Loading ${videoLabel(video)}…`, async () => {
@@ -1009,11 +1073,78 @@ export class UiModel {
 			await this.#run('Preparing service link…', async () => { this.message = await this.#services.openExternal(option.stream.externalUrl!); });
 			return;
 		}
-		await this.#run('Opening video…', async () => {
-			await this.#services.play(option, d.meta, d.videoId, (m) => this.progress(m));
+		await this.#playOption(d, option, 'Opening video…');
+	}
+
+	async #playOption(d: DetailsState, option: StreamOption, message: string): Promise<void> {
+		await this.#run(message, async () => {
+			const started = await this.#services.play(option, d.meta, d.videoId, (m) => this.progress(m));
+			d.lastOption = option;
 			this.screen = 'player';
+			this.#notice = started?.resumedAt
+				? { text: `Resumed at ${clock(started.resumedAt)}. Press X to start from the beginning.`, until: this.#now() + NOTICE_MS, action: 'restart' }
+				: undefined;
 			this.#showOsd();
 		});
+	}
+
+	#stepSeason(step: 1 | -1): void {
+		const d = this.details;
+		if (!d || d.mode !== 'episodes' || !d.seasons || d.seasons.length < 2) return;
+		const i = d.seasons.indexOf(d.season ?? d.seasons[0]);
+		d.season = d.seasons[(Math.max(0, i) + step + d.seasons.length) % d.seasons.length];
+		d.cursor = 0;
+		this.#touch();
+	}
+
+	/**
+	 * Continue with the next episode: load its streams, pick the one that
+	 * matches what was playing, and start it. Without a match the episode's
+	 * stream list opens for the user to choose.
+	 */
+	async #playNext(): Promise<void> {
+		const d = this.details;
+		const next = this.nextEpisode();
+		const previous = d?.lastOption;
+		if (!d || !next || !previous || this.busy) return;
+		this.#services.stop();
+		this.#notice = undefined;
+		this.mediaMenu = undefined;
+		this.osd = { visible: false, hideAt: 0, scrubPresses: 0, lastScrubAt: 0 };
+		this.screen = 'details';
+		const token = ++this.#detailsToken;
+		let picked: StreamOption | undefined;
+		await this.#run(`Next: ${videoLabel(next)}…`, async () => {
+			// Streams arrive add-on by add-on: go as soon as the previous add-on has answered.
+			picked = await new Promise<StreamOption | undefined>((resolve, reject) => {
+				let settled = false;
+				const consider = (details: MetaDetails, final: boolean) => {
+					if (token !== this.#detailsToken) return resolve(undefined);
+					if (settled) { if (!final) this.#streamsArrived(token, next.id, details); return; }
+					d.streams = details.streams;
+					d.pendingAddons = details.pendingAddons ?? 0;
+					d.failedAddons = details.failedAddons ?? 0;
+					const choice = pickNextStream(previous, filterStreams(details.streams, this.#settings).rows);
+					if (choice || final || !details.pendingAddons) { settled = true; resolve(choice); }
+				};
+				d.videoId = next.id;
+				d.mode = 'streams';
+				d.cursor = 0;
+				d.showAll = false;
+				d.streams = [];
+				if (d.seasons) d.season = next.season ?? 0;
+				this.#services.loadDetails(d.meta, next.id, (details) => consider(details, false)).then((details) => consider(details, false), reject);
+				setTimeout(() => consider({ meta: d.meta, streams: d.streams, pendingAddons: 0, failedAddons: d.failedAddons }, true), NEXT_STREAM_WAIT_MS);
+			});
+		});
+		if (token !== this.#detailsToken || this.details !== d || this.screen !== 'details') return;
+		if (!picked) {
+			this.message = `Choose a stream for ${videoLabel(next)}.`;
+			return this.#touch();
+		}
+		const rows = this.streamView().rows;
+		d.cursor = Math.max(0, rows.findIndex((r) => r.option === picked));
+		await this.#playOption(d, picked, `Playing ${videoLabel(next)}…`);
 	}
 
 	// ---- player ----
@@ -1031,6 +1162,19 @@ export class UiModel {
 		}
 		switch (button) {
 			case 'y': return this.openTracks('subtitles');
+			case 'x':
+				if (this.#notice?.action !== 'restart') return;
+				this.#notice = undefined;
+				this.#services.seekTo(0);
+				return this.#showOsd();
+			case 'r': {
+				// Two presses, so a bumped shoulder button does not end the episode.
+				const next = this.nextEpisode();
+				if (!next || !this.details?.lastOption) return;
+				if (this.#notice?.action === 'next') return void this.#playNext();
+				this.#notice = { text: `Press R again for the next episode: ${videoLabel(next)}`, until: this.#now() + NOTICE_MS, action: 'next' };
+				return this.#showOsd();
+			}
 			case 'a':
 				this.#services.togglePause();
 				return this.#showOsd();
@@ -1078,7 +1222,7 @@ export class UiModel {
 			if (this.message === message) this.message = '';
 		} catch (err) {
 			const reason = err instanceof Error ? err.message : String(err);
-			this.message = reason === 'cancelled' ? '' : `Failed: ${reason}`;
+			this.message = reason === 'cancelled' ? '' : friendlyError(reason);
 			if (this.message) this.#services.log(this.message);
 		} finally {
 			this.busy = false;
@@ -1089,6 +1233,39 @@ export class UiModel {
 	#touch(): void {
 		this.version++;
 	}
+}
+
+const NOTICE_MS = 8000;
+const NEXT_STREAM_WAIT_MS = 15000;
+
+function clock(seconds: number): string {
+	const s = Math.max(0, Math.floor(seconds));
+	const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+	const mm = h > 0 ? String(m).padStart(2, '0') : String(m);
+	return `${h > 0 ? `${h}:` : ''}${mm}:${String(s % 60).padStart(2, '0')}`;
+}
+
+/** Episodes in watching order; videos without numbers keep the add-on's order. */
+function sortVideos(videos: Video[]): Video[] {
+	if (!videos.some((v) => v.season !== undefined)) return videos;
+	return videos.map((v, i) => ({ v, i })).sort((a, b) => ((a.v.season ?? 0) - (b.v.season ?? 0)) || ((a.v.episode ?? 0) - (b.v.episode ?? 0)) || (a.i - b.i)).map((x) => x.v);
+}
+
+function episodeDetail(v: Video): string | undefined {
+	const state = v.watched ? 'Watched' : v.progress && v.progress >= 1 ? `${Math.min(99, Math.round(v.progress))}% watched` : v.upcoming ? 'Upcoming' : undefined;
+	return [state, v.released?.slice(0, 10)].filter(Boolean).join('  ·  ') || undefined;
+}
+
+/**
+ * Errors a person can act on, in plain words. A wrong console clock is the
+ * common one: every HTTPS request then fails certificate checks.
+ */
+export function friendlyError(reason: string): string {
+	if (/certificate validity starts in the future|certificate has expired|not yet valid/i.test(reason))
+		return "Your Switch's date and time are wrong, so secure connections fail. Fix them in System Settings > System > Date and Time, then restart.";
+	if (/X509|certificate|SSL|TLS/i.test(reason)) return 'A secure connection failed. Check the Switch\'s date and time and the network, then try again.';
+	if (/Failed to fetch|ENETUNREACH|ENOTFOUND|EAI_AGAIN|network is unreachable|getaddrinfo|resolve host/i.test(reason)) return 'No connection to the add-on. Check that the Switch is online.';
+	return `Failed: ${reason.length > 220 ? `${reason.slice(0, 220)}…` : reason}`;
 }
 
 function cardOf(meta: MetaPreview): Card {

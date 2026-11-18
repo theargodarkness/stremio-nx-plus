@@ -27,11 +27,16 @@
 
 using namespace v8;
 
+// The live Ganesh context (skia_gpu.h), or null when the screen is not GPU-backed.
+class GrDirectContext;
+GrDirectContext *nx_skia_gpu_context(void);
+
 namespace {
 
 struct nx_video_t {
 	// MUST be first: canvas.cc draws any wrapped object as an nx_image_t.
 	nx_image_t image;
+	bool gpu_yuv = false; // requested by JS; used only with a GPU canvas
 	nx_media_t *media = nullptr;
 	int source_id = 0; // registry id of the media source backing this video (0=none)
 	// Stream-source node owned by this video (released on close, AFTER the
@@ -74,6 +79,7 @@ void reset_media(nx_video_t *v) {
 	v->image.data = nullptr;
 	v->image.width = v->image.height = 0;
 	v->image.logical_width = v->image.logical_height = 0;
+	v->image.yuv = false;
 }
 
 void close_video(nx_video_t *v) {
@@ -145,6 +151,7 @@ void nx_video_new(const FunctionCallbackInfo<Value> &info) {
 
 struct video_load_t {
 	int max_width = 0, max_height = 0;
+	bool gpu_yuv = false;
 	nx_video_t *video = nullptr;
 	uint64_t seq = 0;
 	Global<Value> video_val; // pins the wrapper during the load
@@ -166,7 +173,7 @@ void video_load_work(nx_work_t *req) {
 	video_load_t *data = (video_load_t *)req->data;
 	data->media =
 	    nx_media_open(data->path, data->mem, data->mem_size, data->source,
-	                  data->mem_store, data->err_buf, sizeof(data->err_buf), data->max_width, data->max_height);
+	                  data->mem_store, data->err_buf, sizeof(data->err_buf), data->max_width, data->max_height, data->gpu_yuv);
 }
 
 MaybeLocal<Value> video_load_after(Isolate *iso, nx_work_t *req) {
@@ -195,16 +202,25 @@ MaybeLocal<Value> video_load_after(Isolate *iso, nx_work_t *req) {
 	int width = nx_media_render_width(data->media);
 	int height = nx_media_render_height(data->media);
 	if (nx_media_has_video(data->media)) {
-		uint8_t *buf = (uint8_t *)nx_alloc(iso, (size_t)width * height * 4);
+		const bool yuv = nx_media_gpu_yuv(data->media);
+		const size_t bytes = nx_media_frame_bytes(data->media);
+		uint8_t *buf = (uint8_t *)nx_alloc(iso, bytes);
 		if (!buf) {
 			nx_media_destroy(v->media);
 			v->media = nullptr;
 			return MaybeLocal<Value>();
 		}
-		memset(buf, 0, (size_t)width * height * 4);
 		// Opaque black until the first frame presents.
-		for (size_t i = 3; i < (size_t)width * height * 4; i += 4)
-			buf[i] = 0xff;
+		if (yuv) {
+			memset(buf, 16, (size_t)width * height);
+			memset(buf + (size_t)width * height, 128, bytes - (size_t)width * height);
+		} else {
+			memset(buf, 0, bytes);
+			for (size_t i = 3; i < bytes; i += 4)
+				buf[i] = 0xff;
+		}
+		v->image.yuv = yuv;
+		v->image.yuv_matrix = 0;
 		v->image.width = (uint32_t)width;
 		v->image.height = (uint32_t)height;
 		v->image.logical_width = nx_media_width(data->media);
@@ -248,6 +264,8 @@ void nx_video_load(const FunctionCallbackInfo<Value> &info) {
 	data->seq = v->load_seq;
 	data->max_width = v->max_width;
 	data->max_height = v->max_height;
+	// Planar frames can only be drawn by the GPU canvas: never without one.
+	data->gpu_yuv = v->gpu_yuv && nx_skia_gpu_context() != nullptr;
 	data->video_val.Reset(iso, info[0]);
 	if (info[1]->IsString()) {
 		String::Utf8Value path(iso, info[1]);
@@ -406,6 +424,16 @@ void nx_video_set_render_size(const FunctionCallbackInfo<Value> &info) {
 	v->max_height = height;
 }
 
+// videoSetGpuConversion(video, enabled): before loading a source. Frames then
+// reach the canvas as NV12 planes and are converted to RGB on the GPU.
+void nx_video_set_gpu_conversion(const FunctionCallbackInfo<Value> &info) {
+	Isolate *iso = info.GetIsolate();
+	nx_video_t *v = get_video(iso, info[0]);
+	if (!v) return;
+	if (v->media || v->loading_source_id) { nx_throw(iso, "Set GPU colour conversion before loading a source"); return; }
+	v->gpu_yuv = info[1]->BooleanValue(iso);
+}
+
 void nx_video_frame_stats(const FunctionCallbackInfo<Value> &info) {
 	Isolate *iso = info.GetIsolate();
 	nx_video_t *v = get_video(iso, info[0]);
@@ -418,6 +446,7 @@ void nx_video_frame_stats(const FunctionCallbackInfo<Value> &info) {
 	result->Set(context, nx_str(iso, "height"), Integer::NewFromUnsigned(iso, v->image.height)).Check();
 	result->Set(context, nx_str(iso, "transferMs"), Number::New(iso, transfer)).Check();
 	result->Set(context, nx_str(iso, "convertMs"), Number::New(iso, convert)).Check();
+	result->Set(context, nx_str(iso, "gpuConversion"), Boolean::New(iso, v->image.yuv)).Check();
 	info.GetReturnValue().Set(result);
 }
 
@@ -428,6 +457,7 @@ void nx_video_tick(const FunctionCallbackInfo<Value> &info) {
 	if (!v || !v->media || !v->image.data)
 		return;
 	if (nx_media_present(v->media, &v->image.data)) {
+		v->image.yuv_matrix = nx_media_yuv_matrix(v->media);
 		nx_image_release_cache(&v->image);
 		info.GetReturnValue().Set(true);
 	} else {
@@ -630,6 +660,7 @@ void nx_init_video(Isolate *iso, Local<Object> init_obj) {
 	NX_SET_FUNC(init_obj, "videoNew", nx_video_new);
 	NX_SET_FUNC(init_obj, "videoLoad", nx_video_load);
 	NX_SET_FUNC(init_obj, "videoSetRenderSize", nx_video_set_render_size);
+	NX_SET_FUNC(init_obj, "videoSetGpuConversion", nx_video_set_gpu_conversion);
 	NX_SET_FUNC(init_obj, "videoFrameStats", nx_video_frame_stats);
 	NX_SET_FUNC(init_obj, "videoPlay", nx_video_play);
 	NX_SET_FUNC(init_obj, "videoPause", nx_video_pause);

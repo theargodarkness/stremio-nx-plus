@@ -46,6 +46,13 @@ typedef struct {
 	bool streaming;
 	bool gpu_dirty;
 	void *gpu_surface;
+	// Planar video frames (GPU colour conversion): `data` is 8-bit NV12 at
+	// width x height (layout in media-decoder.h) instead of BGRA, `yuv_matrix`
+	// its YCbCr matrix, and `yuv_image` (an sk_sp<SkImage>*) the GPU image
+	// built from the current frame. Such an image only draws on a GPU canvas.
+	bool yuv;
+	int yuv_matrix;
+	void *yuv_image;
 } nx_image_t;
 
 // Release the persistent GPU surface (canvas.cc); safe to call without one.

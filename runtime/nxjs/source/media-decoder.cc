@@ -109,6 +109,11 @@ struct nx_media {
 	int width = 0;
 	int height = 0;
 	int render_width = 0, render_height = 0;
+	// GPU colour conversion: slots hold NV12 at source size (see media-decoder.h).
+	bool gpu_yuv = false;
+	size_t frame_bytes = 0;
+	std::atomic<int> yuv_matrix{0};
+	SwsContext *sws_nv12 = nullptr; // formats without a direct copy
 	std::atomic<int64_t> transfer_peak_us{0}, convert_peak_us{0};
 	double duration = 0;
 	double vframe_dur = 1.0 / 30; // nominal frame duration (seek slack)
@@ -344,6 +349,75 @@ void record_frame_time(std::atomic<int64_t> &peak, std::chrono::steady_clock::ti
 	while (us > previous && !peak.compare_exchange_weak(previous, us, std::memory_order_relaxed)) {}
 }
 
+int yuv_matrix_of(const AVFrame *frame, int colorspace, int range) {
+	const bool full = range == AVCOL_RANGE_JPEG || frame->format == AV_PIX_FMT_YUVJ420P;
+	switch (colorspace) {
+		case AVCOL_SPC_BT709: return full ? 2 : 0;
+		case AVCOL_SPC_BT470BG:
+		case AVCOL_SPC_SMPTE170M: return full ? 3 : 1;
+		case AVCOL_SPC_BT2020_NCL:
+		case AVCOL_SPC_BT2020_CL: return 4;
+		default: return frame->height >= 720 ? (full ? 2 : 0) : (full ? 3 : 1); // unflagged: HD is 709, SD 601
+	}
+}
+
+// Pack `frame` as 8-bit NV12 at w x h into `dst` (layout in media-decoder.h).
+// The decoder's usual outputs are copied directly: NV12 (NVDEC 8-bit), P010
+// (NVDEC 10-bit, high byte kept), planar 4:2:0 at 8 and 10 bits (software).
+// Anything else, or a mid-stream size change, goes through swscale to NV12.
+bool pack_nv12(nx_media *m, const AVFrame *frame, uint8_t *dst, int w, int h) {
+	const int cw = (w + 1) / 2, ch = (h + 1) / 2;
+	uint8_t *dy = dst, *duv = dst + (size_t)w * h;
+	const bool same = frame->width == w && frame->height == h;
+	if (same && frame->format == AV_PIX_FMT_NV12) {
+		for (int y = 0; y < h; y++) memcpy(dy + (size_t)y * w, frame->data[0] + (size_t)y * frame->linesize[0], w);
+		for (int y = 0; y < ch; y++) memcpy(duv + (size_t)y * 2 * cw, frame->data[1] + (size_t)y * frame->linesize[1], 2 * cw);
+		return true;
+	}
+	if (same && frame->format == AV_PIX_FMT_P010LE) {
+		for (int y = 0; y < h; y++) {
+			const uint8_t *s = frame->data[0] + (size_t)y * frame->linesize[0] + 1; // high byte of each LE sample
+			uint8_t *d = dy + (size_t)y * w;
+			for (int x = 0; x < w; x++) d[x] = s[2 * x];
+		}
+		for (int y = 0; y < ch; y++) {
+			const uint8_t *s = frame->data[1] + (size_t)y * frame->linesize[1] + 1;
+			uint8_t *d = duv + (size_t)y * 2 * cw;
+			for (int x = 0; x < 2 * cw; x++) d[x] = s[2 * x];
+		}
+		return true;
+	}
+	if (same && (frame->format == AV_PIX_FMT_YUV420P || frame->format == AV_PIX_FMT_YUVJ420P)) {
+		for (int y = 0; y < h; y++) memcpy(dy + (size_t)y * w, frame->data[0] + (size_t)y * frame->linesize[0], w);
+		for (int y = 0; y < ch; y++) {
+			const uint8_t *u = frame->data[1] + (size_t)y * frame->linesize[1], *v = frame->data[2] + (size_t)y * frame->linesize[2];
+			uint8_t *d = duv + (size_t)y * 2 * cw;
+			for (int x = 0; x < cw; x++) { d[2 * x] = u[x]; d[2 * x + 1] = v[x]; }
+		}
+		return true;
+	}
+	if (same && frame->format == AV_PIX_FMT_YUV420P10LE) {
+		for (int y = 0; y < h; y++) {
+			const uint16_t *s = reinterpret_cast<const uint16_t *>(frame->data[0] + (size_t)y * frame->linesize[0]);
+			uint8_t *d = dy + (size_t)y * w;
+			for (int x = 0; x < w; x++) d[x] = (uint8_t)(s[x] >> 2);
+		}
+		for (int y = 0; y < ch; y++) {
+			const uint16_t *u = reinterpret_cast<const uint16_t *>(frame->data[1] + (size_t)y * frame->linesize[1]);
+			const uint16_t *v = reinterpret_cast<const uint16_t *>(frame->data[2] + (size_t)y * frame->linesize[2]);
+			uint8_t *d = duv + (size_t)y * 2 * cw;
+			for (int x = 0; x < cw; x++) { d[2 * x] = (uint8_t)(u[x] >> 2); d[2 * x + 1] = (uint8_t)(v[x] >> 2); }
+		}
+		return true;
+	}
+	m->sws_nv12 = sws_getCachedContext(m->sws_nv12, frame->width, frame->height, (AVPixelFormat)frame->format, w, h,
+	                                   AV_PIX_FMT_NV12, SWS_BILINEAR, NULL, NULL, NULL);
+	if (!m->sws_nv12) return false;
+	uint8_t *planes[4] = {dy, duv, NULL, NULL};
+	int strides[4] = {w, 2 * cw, 0, 0};
+	return sws_scale(m->sws_nv12, frame->data, frame->linesize, 0, frame->height, planes, strides) == h;
+}
+
 // Blocks until a ring slot is free, then converts `frame` to BGRA into it.
 // Returns false if interrupted (quit/seek).
 bool enqueue_video(nx_media *m, AVFrame *frame, double pts) {
@@ -378,6 +452,15 @@ bool enqueue_video(nx_media *m, AVFrame *frame, double pts) {
 	}
 
 	const auto convert_start = std::chrono::steady_clock::now();
+	if (m->gpu_yuv) {
+		// No colour conversion here: the planes go to the GPU as they are.
+		if (!pack_nv12(m, frame, slot->bgra, m->render_width, m->render_height)) { set_fatal(m, "video frame packing failed", AVERROR(EINVAL)); return false; }
+		m->yuv_matrix.store(yuv_matrix_of(frame, colorspace, color_range), std::memory_order_relaxed);
+		record_frame_time(m->convert_peak_us, convert_start);
+		slot->pts = pts;
+		m->vwrite.store(w + 1, std::memory_order_release);
+		return true;
+	}
 	if (m->converter &&
 	    nx_frame_convert(m->converter, frame, colorspace, color_range, slot->bgra, m->render_width, m->render_height) == 0) {
 		record_frame_time(m->convert_peak_us, convert_start);
@@ -813,7 +896,7 @@ double clock_now(nx_media *m) {
 nx_media_t *nx_media_open(const char *path, const uint8_t *mem,
                           size_t mem_size, nx_media_source *source,
                           std::shared_ptr<void> keepalive, char *errbuf,
-                          size_t errbuf_size, int max_width, int max_height) {
+                          size_t errbuf_size, int max_width, int max_height, bool gpu_yuv) {
 	if (max_width < 0 || max_height < 0 || max_width > 4096 || max_height > 4096 || ((max_width == 0) != (max_height == 0))) {
 		snprintf(errbuf, errbuf_size, "invalid video render bounds");
 		return nullptr;
@@ -916,10 +999,14 @@ nx_media_t *nx_media_open(const char *path, const uint8_t *mem,
 		const double scale = max_width ? std::min({1.0, (double)max_width / m->width, (double)max_height / m->height}) : 1.0;
 		m->render_width = std::max(1, (int)std::floor(m->width * scale));
 		m->render_height = std::max(1, (int)std::floor(m->height * scale));
-		fprintf(stderr, "[video] source %dx%d -> render %dx%d\n", m->width, m->height, m->render_width, m->render_height);
+		// Planes at source size for the GPU; above 1080p the upload outweighs the saving.
+		m->gpu_yuv = gpu_yuv && m->width <= 1920 && m->height <= 1088;
+		if (m->gpu_yuv) { m->render_width = m->width; m->render_height = m->height; }
+		m->frame_bytes = m->gpu_yuv ? nx_yuv_frame_bytes(m->render_width, m->render_height) : (size_t)m->render_width * m->render_height * 4;
+		fprintf(stderr, "[video] source %dx%d -> render %dx%d%s\n", m->width, m->height, m->render_width, m->render_height, m->gpu_yuv ? " (NV12, GPU colour conversion)" : "");
 		for (int i = 0; i < RING_SLOTS; i++) {
 			m->slots[i].bgra =
-			    (uint8_t *)malloc((size_t)m->render_width * m->render_height * 4);
+			    (uint8_t *)malloc(m->frame_bytes);
 			if (!m->slots[i].bgra) {
 				snprintf(errbuf, errbuf_size, "out of memory");
 				goto fail;
@@ -971,6 +1058,9 @@ fail:
 int nx_media_width(nx_media_t *m) { return m->width; }
 int nx_media_height(nx_media_t *m) { return m->height; }
 int nx_media_render_width(nx_media_t *m) { return m->render_width; }
+bool nx_media_gpu_yuv(nx_media_t *m) { return m->gpu_yuv; }
+size_t nx_media_frame_bytes(nx_media_t *m) { return m->frame_bytes; }
+int nx_media_yuv_matrix(nx_media_t *m) { return m->yuv_matrix.load(std::memory_order_relaxed); }
 int nx_media_render_height(nx_media_t *m) { return m->render_height; }
 void nx_media_frame_times(nx_media_t *m, double *transfer_ms, double *convert_ms) {
 	*transfer_ms = m->transfer_peak_us.exchange(0, std::memory_order_relaxed) / 1000.0;
@@ -1404,6 +1494,7 @@ void nx_media_destroy(nx_media_t *m) {
 		nx_audio_stream_set_playing(m->audio_node, false);
 	if (m->sws)
 		sws_freeContext(m->sws);
+	sws_freeContext(m->sws_nv12);
 	if (m->swr)
 		swr_free(&m->swr);
 	if (m->vctx)

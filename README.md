@@ -21,7 +21,9 @@ Browse catalogs and play torrents or direct HTTP links, including compatible deb
 | B | Back; stop playback |
 | L/R | Switch sections |
 | Y | Search (from Home, Discover, Library or Search); open audio/subtitle selection during playback |
-| X | On a stream list: show or hide the streams your filters removed |
+| X | On a stream list: show or hide the streams your filters removed. Just after a resume: start from the beginning |
+| R (twice) | During a series episode: play the next episode |
+| ◀ ▶ | On an episode list: change season |
 | + | Exit |
 
 ## Subtitles
@@ -42,6 +44,8 @@ Open **Settings** (the gear at the bottom of the rail) to choose which streams a
 | Hide HEVC, Hide REMUX, Maximum file size, Sources, Hide uncached debrid | Off | Optional |
 | Excluded words | None | Comma-separated, e.g. `3D, HDTS` |
 | Sort streams | Add-on order | Or best quality, smallest first, most seeders |
+| Video mode | Sharp (720p) | Balanced (540p) and Fast (432p) convert fewer pixels for smoother playback; GPU conversion (experimental) needs a from-source build |
+| Autoplay next episode | On | Continues a series from the same add-on and quality |
 | Diagnostics logging | Off | Per-second player stats in `torrent-log.txt` (costs CPU) |
 
 Quality is read from the stream names add-ons send. A stream whose resolution or size is not listed is never hidden by those filters. The stream list shows each stream's resolution, HDR, codec, size, seeders and debrid cache state as tags. The header shows how many streams the filters hid; press X to show them dimmed, each with the reason it was hidden.

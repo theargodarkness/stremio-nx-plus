@@ -7,6 +7,10 @@ import type { KeyValueStore } from '../shims';
 import type { MaxResolution, SourceFilter, StreamFilters, StreamSort } from '../stremio/stream-info';
 
 export interface Settings extends StreamFilters {
+	/** How decoded frames are prepared for the screen (see VIDEO_MODES). */
+	videoMode: VideoMode;
+	/** When an episode ends, continue with the next one from the same source. */
+	autoplayNext: boolean;
 	/** Per-second player stats in torrent-log.txt (costs CPU and SD writes). */
 	diagnostics: boolean;
 }
@@ -25,10 +29,29 @@ export const DEFAULT_SETTINGS: Readonly<Settings> = Object.freeze({
 	hideUncached: false,
 	excludeKeywords: '',
 	sort: 'addon',
+	videoMode: 'sharp',
+	autoplayNext: true,
 	diagnostics: false,
 });
 
 const STORAGE_KEY = 'stremio-nx:settings';
+
+export type VideoMode = 'sharp' | 'balanced' | 'fast' | 'gpu';
+const VIDEO_MODE_NAMES: VideoMode[] = ['sharp', 'balanced', 'fast', 'gpu'];
+/** CPU conversion size as a fraction of the screen, per mode. */
+const VIDEO_SCALE: Record<VideoMode, number> = { sharp: 1, balanced: 0.75, fast: 0.6, gpu: 1 };
+
+/**
+ * What to ask of the video element for a mode: the largest size frames are
+ * converted to on the CPU, and whether the GPU converts colours instead. GPU
+ * mode falls back to Sharp on a runtime without it (`unavailable`).
+ */
+export function videoPlan(mode: VideoMode, screenWidth: number, screenHeight: number, gpuSupported: boolean): { width: number; height: number; gpu: boolean; unavailable: boolean } {
+	const scale = VIDEO_SCALE[mode] ?? 1;
+	// Even dimensions: 4:2:0 video scales cleanly to them.
+	const even = (n: number) => Math.max(2, Math.round((n * scale) / 2) * 2);
+	return { width: even(screenWidth), height: even(screenHeight), gpu: mode === 'gpu' && gpuSupported, unavailable: mode === 'gpu' && !gpuSupported };
+}
 const RESOLUTIONS: MaxResolution[] = [0, 2160, 1440, 1080, 720, 480];
 const SIZES = [0, 2, 4, 8, 15, 25, 50];
 const SOURCES: SourceFilter[] = ['all', 'http', 'torrent'];
@@ -61,6 +84,9 @@ export const SETTING_ITEMS: SettingItem[] = [
 	{ kind: 'text', key: 'excludeKeywords', label: 'Excluded words', help: 'Comma-separated. Streams that mention any of these are hidden, e.g. 3D, HDTS, Hindi. Press A to edit.', placeholder: 'None' },
 	{ kind: 'choice', key: 'sort', label: 'Sort streams', help: 'Add-on order keeps the order the add-ons send. Best quality puts the highest allowed resolution and cached results first.',
 		choices: [{ value: 'addon', label: 'Add-on order' }, { value: 'quality', label: 'Best quality' }, { value: 'size', label: 'Smallest first' }, { value: 'seeders', label: 'Most seeders' }] },
+	{ kind: 'choice', key: 'videoMode', label: 'Video mode', help: 'Sharp converts each frame at 720p. Balanced (540p) and Fast (432p) convert fewer pixels and let the GPU enlarge them: smoother, slightly softer. GPU skips CPU colour conversion entirely (experimental, needs the from-source build). Applies to the next video.',
+		choices: [{ value: 'sharp', label: 'Sharp (720p)' }, { value: 'balanced', label: 'Balanced (540p)' }, { value: 'fast', label: 'Fast (432p)' }, { value: 'gpu', label: 'GPU conversion (experimental)' }] },
+	{ kind: 'choice', key: 'autoplayNext', label: 'Autoplay next episode', help: 'When an episode ends, the next one starts from the same add-on and quality. R during playback skips to it.', choices: onOff },
 	{ kind: 'choice', key: 'diagnostics', label: 'Diagnostics logging', help: 'Writes per-second player statistics to torrent-log.txt. Costs CPU during playback. Turn on only to report a problem.', choices: onOff },
 	{ kind: 'action', id: 'reset', label: 'Reset to defaults', help: 'Restores the Switch-friendly defaults. Press A to reset.' },
 ];
@@ -75,8 +101,9 @@ export function sanitizeSettings(input: unknown): Settings {
 	if (SIZES.includes(v.maxSizeGB as number)) out.maxSizeGB = v.maxSizeGB as number;
 	if (SOURCES.includes(v.sources as SourceFilter)) out.sources = v.sources as SourceFilter;
 	if (SORTS.includes(v.sort as StreamSort)) out.sort = v.sort as StreamSort;
+	if (VIDEO_MODE_NAMES.includes(v.videoMode as VideoMode)) out.videoMode = v.videoMode as VideoMode;
 	if (typeof v.excludeKeywords === 'string') out.excludeKeywords = v.excludeKeywords.slice(0, 512);
-	for (const key of ['hideHdr', 'hideDolbyVision', 'hideSoftwareCodecs', 'hideHevc', 'hideCam', 'hideRemux', 'hideUncached', 'diagnostics'] as const) bool(key);
+	for (const key of ['hideHdr', 'hideDolbyVision', 'hideSoftwareCodecs', 'hideHevc', 'hideCam', 'hideRemux', 'hideUncached', 'autoplayNext', 'diagnostics'] as const) bool(key);
 	return out;
 }
 

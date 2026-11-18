@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { MemoryStore } from '../src/shims';
-import { DEFAULT_SETTINGS, SETTING_ITEMS, cycleSetting, loadSettings, sanitizeSettings, saveSettings, settingValueLabel } from '../src/app/settings';
+import { DEFAULT_SETTINGS, SETTING_ITEMS, cycleSetting, loadSettings, sanitizeSettings, saveSettings, settingValueLabel, videoPlan } from '../src/app/settings';
 import { sizedImageUrl, ThumbnailCache } from '../src/app/posters';
 
 test('settings round-trip through storage and survive corrupt or out-of-range values', () => {
@@ -88,4 +88,16 @@ test('the poster queue loads what was wanted most recently first and drops stale
 	} finally {
 		g.fetch = saved.fetch;
 	}
+});
+
+test('video modes: conversion size per mode; GPU falls back where the runtime lacks it', () => {
+	assert.deepEqual(videoPlan('sharp', 1280, 720, true), { width: 1280, height: 720, gpu: false, unavailable: false });
+	assert.deepEqual(videoPlan('balanced', 1280, 720, true), { width: 960, height: 540, gpu: false, unavailable: false });
+	assert.deepEqual(videoPlan('fast', 1280, 720, true), { width: 768, height: 432, gpu: false, unavailable: false });
+	assert.deepEqual(videoPlan('gpu', 1280, 720, true), { width: 1280, height: 720, gpu: true, unavailable: false });
+	assert.deepEqual(videoPlan('gpu', 1280, 720, false), { width: 1280, height: 720, gpu: false, unavailable: true });
+	assert.equal(sanitizeSettings({ videoMode: 'turbo' }).videoMode, 'sharp');
+	assert.equal(sanitizeSettings({ videoMode: 'fast' }).videoMode, 'fast');
+	const item = SETTING_ITEMS.find((i) => i.kind === 'choice' && i.key === 'videoMode')!;
+	assert.equal(settingValueLabel(item, cycleSetting(item, { ...DEFAULT_SETTINGS }, 1)), 'Balanced (540p)');
 });

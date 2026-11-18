@@ -11,6 +11,7 @@ import { probes } from './main';
 import { fetchTextLimited, type Addon } from '../stremio/addons';
 import { findSubtitles, parseSubtitles, subtitleTextAt, type Cue, type SubtitleOption } from '../stremio/subtitles';
 import type { TrackOption } from './ui';
+import { videoPlan, type VideoMode } from './settings';
 
 const MiB = 1024 * 1024;
 const PROVIDE_CHUNK = 8 * MiB; // max bytes provided per step
@@ -34,6 +35,8 @@ export interface PlayerOptions {
 	 * heap walk (10-30 ms JS stalls) and the long log line built every second.
 	 */
 	diagnostics?: () => boolean;
+	/** Settings > Video mode, read when the video is created. */
+	videoMode?: () => VideoMode;
 }
 
 export class MediaPlayer {
@@ -44,6 +47,7 @@ export class MediaPlayer {
 	subtitleDelay = 0;
 	subtitleNotice = '';
 	#subtitleSelection = 'off';
+	#gpuUnavailable = false;
 	#imageId = 0;
 	#image?: SubtitleImage;
 	#subtitleOptions: SubtitleOption[] = [];
@@ -73,7 +77,11 @@ export class MediaPlayer {
 		this.#opts = opts;
 		this.#source = new Switch.MediaSource(file.length);
 		this.#video = new Video();
-		this.#video.setRenderSize(screen.width, screen.height);
+		const plan = videoPlan(opts.videoMode?.() ?? 'sharp', screen.width, screen.height, typeof this.#video.setGpuConversion === 'function');
+		this.#video.setRenderSize(plan.width, plan.height);
+		if (plan.gpu) this.#video.setGpuConversion!(true);
+		this.#gpuUnavailable = plan.unavailable;
+		opts.log(`video mode ${opts.videoMode?.() ?? 'sharp'}: convert up to ${plan.width}x${plan.height}${plan.gpu ? ', GPU colour conversion requested' : ''}${plan.unavailable ? ' (GPU conversion is not in this runtime; using Sharp)' : ''}`);
 		this.#video.onerror = () => this.#fail(new Error('The video could not be decoded. Try another source.'));
 		this.#video.oncanplay = () => opts.log('canplay');
 		this.#video.addEventListener('ended', () => opts.onEnded?.());
@@ -96,10 +104,10 @@ export class MediaPlayer {
 		const native = kind === 'audio' ? v.audioTracks : v.subtitleTracks;
 		const rows = native.map(t => ({ id: kind === 'audio' ? String(t.id) : `embedded:${t.id}`,
 			label: `${t.language}${t.label ? ' · ' + t.label : ''} · ${codecLabel(t.codec)}${!t.supported ? ' (unsupported)' : ''}`,
-			selected: kind === 'audio' ? t.id === v.selectedAudioTrack : this.#subtitleSelection === `embedded:${t.id}`, enabled: t.supported }));
+			selected: kind === 'audio' ? t.id === v.selectedAudioTrack : this.#subtitleSelection === `embedded:${t.id}`, enabled: t.supported, language: t.language }));
 		if (kind === 'audio') return rows;
 		return [{ id: 'off', label: 'Off', selected: this.#subtitleSelection === 'off', enabled: true }, ...rows,
-			...this.#subtitleOptions.map((t, i) => ({ id: `external:${i}`, label: t.label, selected: this.#subtitleSelection === `external:${i}`, enabled: true }))];
+			...this.#subtitleOptions.map((t, i) => ({ id: `external:${i}`, label: t.label, selected: this.#subtitleSelection === `external:${i}`, enabled: true, language: t.language }))];
 	}
 
 	async selectTrack(kind: 'audio' | 'subtitles', id: string): Promise<void> {
@@ -184,7 +192,7 @@ export class MediaPlayer {
 			// Unlabelled 4K slips past the stream filters; say why it may stutter.
 			notice: this.#started && (this.#video.videoWidth > 2048 || this.#video.videoHeight > 1200)
 				? `${this.#video.videoWidth}x${this.#video.videoHeight} source: above what the Switch plays smoothly. Pick a 1080p stream if it stutters.`
-				: undefined,
+				: this.#gpuUnavailable ? 'GPU conversion is not in this build of the app. Playing in Sharp mode.' : undefined,
 		};
 	}
 
@@ -419,7 +427,7 @@ export class MediaPlayer {
 			const frame = video.getFrameStats();
 			// Negative: the longest render pause ended before this tick; near 0: right at it.
 			const gapPhase = probes.gapAtMs ? Math.round(probes.gapAtMs - tickStart) : 0;
-			log(`decoder ${video.decoder} source ${video.videoWidth}x${video.videoHeight} render ${frame.width}x${frame.height} transfer max ${frame.transferMs.toFixed(1)} ms convert max ${frame.convertMs.toFixed(1)} ms | ` +
+			log(`decoder ${video.decoder} source ${video.videoWidth}x${video.videoHeight} render ${frame.width}x${frame.height}${frame.gpuConversion ? ' NV12/GPU' : ''} transfer max ${frame.transferMs.toFixed(1)} ms convert max ${frame.convertMs.toFixed(1)} ms | ` +
 				(s ? `peers ${s.peers} (dht ${s.dhtPeers}) | pieces ${s.completedPieces}/${s.totalPieces} (+${ratePieces}/s) | ` : `HTTP ${httpRate.toFixed(2)} MiB/s lanes ${pending.length}/${laneTarget} requests ${this.#http?.requests ?? 0} retries ${this.#http?.retries ?? 0} | `) +
 					`buffer ${this.#rebuffering ? 'refilling' : this.#userPaused ? 'paused' : this.#started ? 'playing' : 'starting'} est ${(source.buffered(pos) / targets.rate).toFixed(1)}s goal ${(targets.ahead / MiB).toFixed(0)} MiB prefix ${(prefix / MiB).toFixed(1)} MiB | ` +
 					`ahead ${aheadMiB} MiB | buffers cache ${((memory?.cachedBytes ?? 0) / MiB).toFixed(1)} partial ${((memory?.partialBytes ?? 0) / MiB).toFixed(1)} source ${(source.storedBytes / MiB).toFixed(1)} MiB v8physical ${((native.totalPhysicalSize ?? 0) / MiB).toFixed(0)} nativeFree ${(((native.nativeHeapTotal ?? 0) - (native.nativeHeapUsed ?? 0)) / MiB).toFixed(0)} fonts ${fonts.size} | t=${t.toFixed(0)}s${stalled ? ' STALL' : ''} | ` +

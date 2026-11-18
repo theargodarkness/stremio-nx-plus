@@ -58,7 +58,24 @@ struct nx_media_source; // in-process byte source (media-source.h)
 nx_media_t *nx_media_open(const char *path, const uint8_t *mem,
                           size_t mem_size, nx_media_source *source,
                           std::shared_ptr<void> keepalive, char *errbuf,
-                          size_t errbuf_size, int max_width = 0, int max_height = 0);
+                          size_t errbuf_size, int max_width = 0, int max_height = 0,
+                          bool gpu_yuv = false);
+
+// GPU colour conversion. With `gpu_yuv` (and a source of at most 1920x1088),
+// presentation buffers hold the frame as 8-bit NV12 at source size instead of
+// BGRA at render size: plane 0 is Y (stride = width), plane 1 interleaved CbCr
+// (stride = 2 * ceil(width / 2), ceil(height / 2) rows), packed back to back.
+// The renderer uploads the two planes and converts and scales on the GPU, so
+// swscale leaves the per-frame path. render_width/height then equal the source.
+bool nx_media_gpu_yuv(nx_media_t *m);
+// Bytes in one presentation buffer (either layout).
+size_t nx_media_frame_bytes(nx_media_t *m);
+// YCbCr matrix of the frames: 0 BT.709 limited, 1 BT.601 limited, 2 BT.709
+// full, 3 BT.601 full (JPEG), 4 BT.2020 limited.
+int nx_media_yuv_matrix(nx_media_t *m);
+inline size_t nx_yuv_frame_bytes(int width, int height) {
+	return (size_t)width * height + (size_t)2 * ((width + 1) / 2) * ((height + 1) / 2);
+}
 
 // Metadata (valid after a successful open).
 int nx_media_width(nx_media_t *m);

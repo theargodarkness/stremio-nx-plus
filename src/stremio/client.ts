@@ -43,6 +43,10 @@ export interface Video {
 	season?: number;
 	episode?: number;
 	released?: string;
+	/** From the user's library: finished, or how far in (percent). */
+	watched?: boolean;
+	progress?: number | null;
+	upcoming?: boolean;
 }
 
 /** A catalog an installed addon offers. */
@@ -86,6 +90,17 @@ export interface MetaDetails {
 	pendingAddons?: number;
 	/** Stream add-ons that failed or timed out. */
 	failedAddons?: number;
+	/** Where the user left off in this title (from the library). */
+	lastVideoId?: string;
+}
+
+/** What the core knows when a stream is loaded into the player. */
+export interface PlayerLoad {
+	stream: Stream;
+	/** Milliseconds into this video where the user stopped last time (0 = start). */
+	resumeMs: number;
+	/** The episode that follows this one. */
+	nextVideo?: Video;
 }
 
 export interface StreamingServerState {
@@ -98,6 +113,7 @@ export interface StreamingServerState {
 
 interface DetailsState {
 	selected?: { streamPath?: { id?: string } | null } | null;
+	libraryItem?: { state?: { video_id?: string | null } } | null;
 	metaItem: { content: Loadable<MetaItem> } | null;
 	streams: { addon: { manifest: { name: string }; transportUrl: string }; content: Loadable<Stream[]> }[];
 }
@@ -108,6 +124,8 @@ interface CatalogState {
 
 interface PlayerState {
 	selected: { stream: Stream } | null;
+	nextVideo?: Video | null;
+	libraryItem?: { state?: { timeOffset?: number; video_id?: string | null } } | null;
 }
 
 /** A catalog row on the board or in search results. */
@@ -388,7 +406,7 @@ export class StremioClient {
 				}
 				for (const stream of entry.content.content) streams.push({ addonName: entry.addon.manifest.name, addonUrl: entry.addon.transportUrl, stream });
 			}
-			return { meta, streams, pendingAddons: pending, failedAddons: failed };
+			return { meta, streams, pendingAddons: pending, failedAddons: failed, lastVideoId: s.libraryItem?.state?.video_id ?? undefined };
 		};
 		const first = snapshot(state, false);
 		if (onUpdate && first.pendingAddons) {
@@ -410,7 +428,7 @@ export class StremioClient {
 	}
 
 	/** Load the Player with a chosen stream; returns the stream the core selected. */
-	async loadPlayer(option: StreamOption, meta: MetaPreview, videoId = meta.id): Promise<Stream> {
+	async loadPlayer(option: StreamOption, meta: MetaPreview, videoId = meta.id): Promise<PlayerLoad> {
 		const { deepLinks: _deepLinks, ...stream } = option.stream;
 		this.dispatch(
 			{
@@ -428,7 +446,38 @@ export class StremioClient {
 			'player',
 		);
 		const state = await this.waitState<PlayerState>('player', (s) => !!s.selected);
-		return state.selected!.stream;
+		return { stream: state.selected!.stream, ...this.playerProgress(videoId) };
+	}
+
+	/**
+	 * The resume point and next episode for the loaded video. They come from
+	 * the meta item and library, which can arrive a moment after the stream.
+	 */
+	playerProgress(videoId: string): { resumeMs: number; nextVideo?: Video } {
+		const state = this.getState<PlayerState>('player');
+		const item = state.libraryItem?.state;
+		return { resumeMs: item?.video_id === videoId ? Math.max(0, item.timeOffset ?? 0) : 0, nextVideo: state.nextVideo ?? undefined };
+	}
+
+	/**
+	 * Report playback to the core, which keeps the library's resume point,
+	 * watched episodes and Continue Watching (and syncs them when signed in).
+	 */
+	playerTime(timeMs: number, durationMs: number): void {
+		if (!(durationMs > 0) || !(timeMs >= 0)) return;
+		this.dispatch({ action: 'Player', args: { action: 'TimeChanged', args: { time: Math.round(timeMs), duration: Math.round(durationMs), device: 'switch' } } }, 'player');
+	}
+
+	playerPaused(paused: boolean): void {
+		this.dispatch({ action: 'Player', args: { action: 'PausedChanged', args: { paused } } }, 'player');
+	}
+
+	playerEnded(): void {
+		this.dispatch({ action: 'Player', args: { action: 'Ended' } }, 'player');
+	}
+
+	unloadPlayer(): void {
+		this.dispatch({ action: 'Unload' }, 'player');
 	}
 }
 

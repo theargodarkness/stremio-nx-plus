@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.6.0: video modes and GPU colour conversion
+
+### Added
+- **Settings > Video mode.** Chooses how decoded frames are prepared for the screen; applies to the next video.
+  - **Sharp (720p)**: the default, as before.
+  - **Balanced (540p)** and **Fast (432p)**: frames are converted at a smaller size (44% and 64% fewer pixels) and enlarged by the GPU. Smoother on heavy streams, slightly softer. These work with any runtime.
+  - **GPU conversion (experimental)**: no CPU colour conversion at all (native runtime: needs a from-source build).
+- **GPU colour conversion** (runtime). The decoder hands frames over as NV12 planes at source size, and Skia uploads the two planes and converts and scales them in the fragment shader (`SkImages::TextureFromYUVAPixmaps`). swscale leaves the per-frame path: what remains on the CPU is a copy of about 3 MB per 1080p frame (1-2 ms on the host, against tens of milliseconds of conversion on the console). 10-bit video is reduced to 8 bits during that copy. The upload is smaller than before as well (3.1 MB of planes against 3.7 MB of BGRA).
+  - Used for sources up to 1920x1088 on a GPU-backed screen. Larger sources, a raster screen, or a runtime without the feature fall back to CPU conversion, and the player says so.
+  - Not yet run on a Switch. It is off unless selected; if the picture is wrong or memory grows, switch back to Sharp and report it with a diagnostics log (the stats line shows `NV12/GPU`).
+
+### Developer
+- `npm run native-check` gains `decoder-yuv`: the NV12 frame is byte-identical to ffmpeg's own for 8-bit, within rounding of the CPU path for 10-bit, and refused above 1080p.
+- The canvas change compiles against Skia m146 and m159 headers; the binding against V8 15.0.
+
+## 0.5.0: resume, seasons, next episode
+
+### Added
+- **Resume where you left off.** Playback position is now reported to the Stremio core, which it never was before. Videos resume from where you stopped (X within 8 seconds starts over), Continue Watching fills in, and progress syncs to your Stremio account when signed in.
+- **Seasons.** Series list one season at a time (◀ ▶ or L/R to switch, specials last) and open on the episode you watched last. Episodes show Watched, percent watched or Upcoming.
+- **Next episode.** When an episode ends, the next one starts from the same add-on and quality (same release group when the add-on marks one). Press R twice during playback to skip ahead. If no matching stream exists, the episode's stream list opens instead. Settings > Autoplay next episode turns it off.
+- **Remembered languages.** The audio and subtitle language you pick (or subtitles off) is selected again on the next video that has it.
+- **Instant home screen.** The rows from the last launch show at once and are replaced as add-ons answer.
+- **Clear error messages.** A wrong console date, the cause of "certificate validity starts in the future", is now explained on screen with where to fix it; network failures are worded plainly.
+- The player title shows the episode.
+
+### Changed
+- X and − in the player only open the developer overlays while Diagnostics logging is on. Before, a stray X press could blank the video.
+
+### Developer
+- `watch.test.ts` and new `ui.test.ts` cases; `npm run core-watch` checks resume, watched state and Continue Watching against the real stremio-core.
+
 ## 0.4.0: image subtitles (PGS, VobSub, DVB)
 
 ### Added (native runtime: needs a from-source build, see docs/building.md)

@@ -37,7 +37,9 @@ interface VideoMediaTrack {
 }
 interface Video {
 	setRenderSize(maxWidth: number, maxHeight: number): void;
-	getFrameStats(): { width: number; height: number; transferMs: number; convertMs: number };
+	/** Colour conversion on the GPU; absent on runtimes built before it existed. */
+	setGpuConversion?(enabled: boolean): void;
+	getFrameStats(): { width: number; height: number; transferMs: number; convertMs: number; gpuConversion?: boolean };
 	readonly decoder: 'software' | 'nvdec-pending' | 'nvdec';
 	readonly audioTracks: VideoMediaTrack[];
 	readonly subtitleTracks: VideoMediaTrack[];

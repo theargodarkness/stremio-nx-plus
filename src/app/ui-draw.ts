@@ -337,7 +337,23 @@ function drawDetails(ctx: CanvasRenderingContext2D, ui: UiModel, image: ImageLoo
 	const rows = ui.listRows();
 	ctx.fillStyle = COLOR.text;
 	ctx.font = 'bold 20px sans-serif';
-	ctx.fillText(d.mode === 'episodes' ? 'Episodes' : 'Streams', CONTENT_X, 428);
+	const seasonName = d.season === undefined ? 'Episodes' : d.season === 0 ? 'Specials' : `Season ${d.season}`;
+	ctx.fillText(d.mode === 'episodes' ? seasonName : 'Streams', CONTENT_X, 428);
+	if (d.mode === 'episodes' && d.seasons && d.seasons.length > 1) {
+		// Season switcher: ◀ ▶ on the pad, or tap the arrows.
+		const x = CONTENT_X + Math.round(measure(ctx, seasonName)) + 18;
+		ctx.fillStyle = COLOR.panelHi;
+		roundRect(ctx, x, 408, 34, 28, 14);
+		roundRect(ctx, x + 40, 408, 34, 28, 14);
+		ctx.fillStyle = COLOR.text;
+		ctx.fillText('‹', x + 12, 428);
+		ctx.fillText('›', x + 52, 428);
+		ctx.fillStyle = COLOR.muted;
+		ctx.font = '16px sans-serif';
+		ctx.fillText(`${d.seasons.indexOf(d.season ?? d.seasons[0]) + 1} of ${d.seasons.length} seasons  ·  ${rows.length} episode${rows.length === 1 ? '' : 's'}`, x + 88, 427);
+		hits.push({ x: x - 6, y: 398, w: 44, h: 46, target: { kind: 'season', step: -1 } });
+		hits.push({ x: x + 38, y: 398, w: 44, h: 46, target: { kind: 'season', step: 1 } });
+	}
 	const ROW_H = 46;
 	const top = 444;
 	const visible = Math.floor((H - FOOTER_H - top) / ROW_H);
@@ -721,10 +737,12 @@ export function drawOsd(ctx: CanvasRenderingContext2D, ui: UiModel, playback: Pl
 		ctx.fillStyle = COLOR.muted;
 		ctx.font = '16px sans-serif';
 		ctx.fillText('Paused', CONTENT_X + 56, H - 20);
-	} else if (playback?.notice) {
-		ctx.fillStyle = '#ffcf8a';
-		ctx.font = '16px sans-serif';
-		ctx.fillText(clip(ctx, playback.notice, CONTENT_W - 56), CONTENT_X + 56, H - 20);
+	} else if (ui.playerNotice() || playback?.notice) {
+		// The app's own message (resume point, next episode) before the stream hint.
+		const own = ui.playerNotice();
+		ctx.fillStyle = own ? COLOR.text : '#ffcf8a';
+		ctx.font = own ? 'bold 17px sans-serif' : '16px sans-serif';
+		ctx.fillText(clip(ctx, own || playback!.notice!, CONTENT_W - 56), CONTENT_X + 56, H - 20);
 	}
 	if (ui.mediaMenu) drawTracks(ctx, ui, hits);
 }

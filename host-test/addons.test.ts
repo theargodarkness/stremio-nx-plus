@@ -33,7 +33,7 @@ test('configured links, bounded manifests, core persistence and paired add-on ma
 		await core.installAddon(addon.transportUrl);
 		assert.ok(core.addons().some(a => a.transportUrl === addon.transportUrl));
 		const videoStream = { url: 'https://video.example/movie.mkv?token=private', behaviorHints: { filename: 'movie.mkv', proxyHeaders: { request: { Authorization: 'Bearer test' } } } };
-		const selected = await core.loadPlayer({ addonName: 'Sample', addonUrl: addon.transportUrl, stream: videoStream }, { id: 'tt1', type: 'movie', name: 'Sample' });
+		const { stream: selected } = await core.loadPlayer({ addonName: 'Sample', addonUrl: addon.transportUrl, stream: videoStream }, { id: 'tt1', type: 'movie', name: 'Sample' });
 		assert.equal(selected.url, videoStream.url);
 		assert.deepEqual(selected.behaviorHints?.proxyHeaders?.request, videoStream.behaviorHints.proxyHeaders.request);
 		await new Promise(resolve => setTimeout(resolve, 20));

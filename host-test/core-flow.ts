@@ -49,7 +49,7 @@ async function main() {
 		}
 		const option = last?.streams.find((s) => s.stream.infoHash);
 		if (!last || !option) throw new Error('no torrent stream offered');
-		const selected = await core.loadPlayer(option, last.meta);
+		const { stream: selected } = await core.loadPlayer(option, last.meta);
 		const request = torrentRequestFromStream(selected);
 		if (!request) throw new Error('selected stream is not a torrent');
 		console.log(`[flow] core selected torrent ${request.infoHash.toHex()} fileIdx=${request.fileIdx} announce=${request.announce.length}`);

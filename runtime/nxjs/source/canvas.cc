@@ -42,6 +42,10 @@
 #include "include/gpu/GpuTypes.h"
 #include "include/gpu/ganesh/GrDirectContext.h"
 #include "include/gpu/ganesh/SkSurfaceGanesh.h"
+#include "include/gpu/ganesh/SkImageGanesh.h"
+#include "include/core/SkColorSpace.h"
+#include "include/core/SkYUVAInfo.h"
+#include "include/core/SkYUVAPixmaps.h"
 #include "skia_gpu.h"
 #include "include/core/SkSamplingOptions.h"
 #include "include/core/SkStream.h"
@@ -587,6 +591,28 @@ static void stroke_op(nx_canvas_context_2d_t *context, bool /*preserve*/) {
 }
 
 // Set the path fill rule from a JS string ("evenodd" -> EvenOdd).
+
+// A GPU image of an NV12 video frame (`img->data`: Y plane, then interleaved
+// CbCr; layout in media-decoder.h). The planes are uploaded as two textures
+// and converted with the frame's YCbCr matrix when drawn.
+static sk_sp<SkImage> nx_yuv_frame_image(GrDirectContext *gr, const nx_image_t *img) {
+	static const SkYUVColorSpace kMatrices[] = {
+	    kRec709_Limited_SkYUVColorSpace, kRec601_Limited_SkYUVColorSpace, kRec709_Full_SkYUVColorSpace,
+	    kJPEG_Full_SkYUVColorSpace, kBT2020_8bit_Limited_SkYUVColorSpace};
+	const int w = (int)img->width, h = (int)img->height;
+	const int matrix = img->yuv_matrix >= 0 && img->yuv_matrix < 5 ? img->yuv_matrix : 0;
+	SkYUVAInfo info(SkISize::Make(w, h), SkYUVAInfo::PlaneConfig::kY_UV, SkYUVAInfo::Subsampling::k420,
+	                kMatrices[matrix]);
+	const size_t row_bytes[SkYUVAInfo::kMaxPlanes] = {(size_t)w, (size_t)2 * ((w + 1) / 2), 0, 0};
+	SkYUVAPixmapInfo pixmap_info(info, SkYUVAPixmapInfo::DataType::kUnorm8, row_bytes);
+	if (!pixmap_info.isValid())
+		return nullptr;
+	SkYUVAPixmaps pixmaps = SkYUVAPixmaps::FromExternalMemory(pixmap_info, img->data);
+	if (!pixmaps.isValid())
+		return nullptr;
+	return SkImages::TextureFromYUVAPixmaps(gr, pixmaps, skgpu::Mipmapped::kNo, false, nullptr);
+}
+
 static void set_fill_rule_v(Isolate *iso, Local<Value> fill_rule,
                             nx_canvas_context_2d_t *context) {
 	SkPathFillType rule = SkPathFillType::kWinding;
@@ -2329,7 +2355,31 @@ void nx_canvas_context_2d_draw_image(const FunctionCallbackInfo<Value> &info) {
 		// below would otherwise allocate a fresh 8 MB image + texture for
 		// every frame, and on this platform those pile up in native memory
 		// far faster than they are reclaimed.
-		if (img->streaming && cr->recordingContext()) {
+		if (img->streaming && img->yuv) {
+			// Planar video frame: upload Y and CbCr as two textures; Ganesh
+			// converts to RGB (and scales) in the draw's fragment shader.
+			GrDirectContext *gr = cr->recordingContext() ? nx_skia_gpu_context() : nullptr;
+			if (!gr)
+				return; // NV12 data cannot be drawn by the raster path
+			sk_sp<SkImage> *holder = static_cast<sk_sp<SkImage> *>(img->yuv_image);
+			if (img->gpu_dirty || !holder || !*holder) {
+				// Let go of the last frame's textures first so they are reused.
+				if (holder)
+					holder->reset();
+				sk_sp<SkImage> fresh = nx_yuv_frame_image(gr, img);
+				if (!fresh)
+					return;
+				if (!holder) {
+					holder = new sk_sp<SkImage>();
+					img->yuv_image = holder;
+				}
+				*holder = std::move(fresh);
+				img->gpu_dirty = false;
+			}
+			image = *holder;
+			source_w = img->width;
+			source_h = img->height;
+		} else if (img->streaming && cr->recordingContext()) {
 			GrDirectContext *gr = nx_skia_gpu_context();
 			sk_sp<SkSurface> *surf =
 			    static_cast<sk_sp<SkSurface> *>(img->gpu_surface);
@@ -2791,6 +2841,10 @@ void nx_image_release_gpu(nx_image_t *image) {
 	if (image && image->gpu_surface) {
 		delete static_cast<sk_sp<SkSurface> *>(image->gpu_surface);
 		image->gpu_surface = nullptr;
+	}
+	if (image && image->yuv_image) {
+		delete static_cast<sk_sp<SkImage> *>(image->yuv_image);
+		image->yuv_image = nullptr;
 	}
 }
 

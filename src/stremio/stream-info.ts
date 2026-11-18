@@ -250,3 +250,19 @@ export function filterStreams(options: StreamOption[], f: StreamFilters, showAll
 	const strip = ({ option, info, hiddenBy }: FilteredStream): FilteredStream => ({ option, info, hiddenBy });
 	return { rows: (showAll ? [...shown, ...hidden] : shown).map(strip), shown: shown.length, hidden: hidden.length };
 }
+
+/**
+ * The stream to continue a series with: the same release group the add-on
+ * marks as binge-compatible, else the same add-on at the same resolution,
+ * else that add-on's first shown stream. Undefined leaves the choice to the user.
+ */
+export function pickNextStream(previous: StreamOption, rows: FilteredStream[]): StreamOption | undefined {
+	const playable = rows.filter((r) => !r.hiddenBy && (r.info.kind === 'url' || r.info.kind === 'torrent'));
+	const sameAddon = playable.filter((r) => r.option.addonUrl === previous.addonUrl);
+	const group = (o: StreamOption) => (o.stream.behaviorHints as { bingeGroup?: string } | undefined)?.bingeGroup;
+	const wanted = group(previous);
+	const before = streamInfo(previous.stream);
+	return (wanted ? sameAddon.find((r) => group(r.option) === wanted) : undefined)?.option
+		?? sameAddon.find((r) => r.info.resolution === before.resolution && r.info.kind === before.kind)?.option
+		?? sameAddon[0]?.option;
+}

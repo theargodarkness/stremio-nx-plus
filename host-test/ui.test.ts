@@ -580,3 +580,124 @@ test('other keyboard prompts show their label and text above the keyboard too', 
 	assert.equal(saved.at(-1)?.excludeKeywords, '3D, HDTS');
 	assert.equal(ui.keyboard, undefined);
 });
+
+// ---- seasons, resume and next episode ----
+
+const ep = (s: number, e: number, extra: object = {}) => ({ id: `tt9:${s}:${e}`, title: `Ep ${e}`, season: s, episode: e, ...extra });
+const seriesVideos = [ep(2, 1), ep(1, 2, { watched: true }), ep(1, 1, { watched: true }), ep(0, 1), ep(2, 2), ep(2, 3, { upcoming: true })];
+const epStream = (videoId: string): StreamOption => ({ addonName: 'T', addonUrl: 'http://t', stream: { name: 'T\n1080p', title: `${videoId} 1080p x264`, url: `https://v.example/${videoId}.mkv` } });
+
+function seriesFake(calls: string[], extra: Partial<UiServices> = {}) {
+	return fake(calls, {
+		loadDetails: async (it, videoId) => ({ meta: { ...it, type: 'series', videos: seriesVideos }, streams: videoId ? [epStream(videoId)] : [], lastVideoId: 'tt9:1:2' }),
+		...extra,
+	});
+}
+
+test('a series opens on the season and episode last watched; ◀ ▶ switch seasons, specials last', async () => {
+	const { services } = seriesFake([]);
+	const ui = new UiModel(services); await settle();
+	ui.press('a'); await settle();
+	const d = ui.details!;
+	assert.deepEqual(d.seasons, [1, 2, 0]);
+	assert.equal(d.season, 1);
+	assert.deepEqual(ui.listRows().map((r) => [r.label, r.detail]), [['S1E1 Ep 1', 'Watched'], ['S1E2 Ep 2', 'Watched']], 'sorted, with watched state');
+	assert.equal(d.cursor, 1, 'on the episode last watched');
+	ui.press('right');
+	assert.equal(d.season, 2);
+	assert.equal(ui.listRows().length, 3);
+	assert.equal(ui.listRows()[2].detail, 'Upcoming');
+	ui.press('right');
+	assert.equal(d.season, 0);
+	ui.tap({ kind: 'season', step: 1 });
+	assert.equal(d.season, 1, 'wraps');
+	ui.press('left'); ui.press('left');
+	assert.equal(d.season, 2);
+	ui.press('a'); await settle(); // S2E1 streams
+	assert.equal(d.videoId, 'tt9:2:1');
+	ui.press('b');
+	assert.equal(d.season, 2, 'back on the season of the episode');
+	assert.match(ui.hint(), /◀ ▶ season/);
+});
+
+test('resuming shows where and X starts over, once', async () => {
+	const calls: string[] = [];
+	let now = 0;
+	const { services } = fake(calls, { play: async () => ({ resumedAt: 754 }), seekTo: (t) => { calls.push(`seek ${t}`); } });
+	const ui = new UiModel(services, () => now); await settle();
+	ui.press('a'); await settle();
+	ui.press('a'); await settle();
+	assert.equal(ui.screen, 'player');
+	assert.equal(ui.playerNotice(), 'Resumed at 12:34. Press X to start from the beginning.');
+	ui.press('x');
+	assert.ok(calls.includes('seek 0'));
+	assert.equal(ui.playerNotice(), '');
+	ui.press('x');
+	assert.equal(calls.filter((c) => c === 'seek 0').length, 1);
+	now = 20000; ui.tick(now);
+	assert.equal(ui.playerNotice(), '');
+});
+
+test('when an episode ends the next one plays from the same add-on; the last one returns to the title', async () => {
+	const calls: string[] = [];
+	const played: string[] = [];
+	const { services } = seriesFake(calls, { play: async (_o, _m, videoId) => { played.push(videoId); } });
+	const ui = new UiModel(services); await settle();
+	ui.press('a'); await settle();   // series, cursor on S1E2
+	ui.press('a'); await settle();   // its streams
+	ui.press('a'); await settle();   // play
+	assert.deepEqual(played, ['tt9:1:2']);
+	assert.equal(ui.nextEpisode()?.id, 'tt9:2:1', 'crosses into the next season');
+	assert.match(ui.hint(), /R next episode/);
+	ui.playbackEnded(); await settle(); await settle();
+	assert.deepEqual(played, ['tt9:1:2', 'tt9:2:1']);
+	assert.equal(ui.screen, 'player');
+	assert.equal(ui.details!.season, 2);
+	ui.playbackEnded(); await settle(); await settle();
+	assert.deepEqual(played.at(-1), 'tt9:2:2');
+	assert.equal(ui.nextEpisode(), undefined, 'upcoming and special episodes are not queued');
+	ui.playbackEnded(); await settle();
+	assert.equal(ui.screen, 'details');
+});
+
+test('R skips to the next episode on the second press; autoplay can be turned off', async () => {
+	const played: string[] = [];
+	let now = 0;
+	const { services } = seriesFake([], { play: async (_o, _m, videoId) => { played.push(videoId); }, getSettings: () => ({ ...DEFAULT_SETTINGS, autoplayNext: false }) });
+	const ui = new UiModel(services, () => now); await settle();
+	ui.press('a'); await settle(); ui.press('a'); await settle(); ui.press('a'); await settle();
+	ui.press('r');
+	assert.match(ui.playerNotice(), /Press R again for the next episode: S2E1/);
+	assert.equal(played.length, 1);
+	now = 9000; ui.tick(now); // the prompt expired: a later press asks again
+	ui.press('r');
+	assert.equal(played.length, 1);
+	ui.press('r'); await settle(); await settle();
+	assert.deepEqual(played, ['tt9:1:2', 'tt9:2:1']);
+	ui.playbackEnded(); await settle();
+	assert.equal(ui.screen, 'details', 'autoplay off: back to the title');
+	assert.equal(played.length, 2);
+});
+
+test('without a matching stream the next episode opens its stream list instead of guessing', async () => {
+	const played: string[] = [];
+	const { services } = seriesFake([], {
+		play: async (_o, _m, videoId) => { played.push(videoId); },
+		loadDetails: async (it, videoId) => ({ meta: { ...it, type: 'series', videos: seriesVideos }, lastVideoId: 'tt9:1:2',
+			streams: videoId === 'tt9:1:2' ? [epStream(videoId)] : videoId ? [{ ...epStream(videoId), addonUrl: 'http://other', addonName: 'O' }] : [] }),
+	});
+	const ui = new UiModel(services); await settle();
+	ui.press('a'); await settle(); ui.press('a'); await settle(); ui.press('a'); await settle();
+	ui.playbackEnded(); await settle(); await settle();
+	assert.equal(played.length, 1);
+	assert.equal(ui.screen, 'details');
+	assert.equal(ui.details!.videoId, 'tt9:2:1');
+	assert.equal(ui.message, 'Choose a stream for S2E1 Ep 1.');
+	assert.equal(ui.listRows().length, 1);
+});
+
+test('a wrong console clock is named when no catalog loads', async () => {
+	const { services } = fake([], { continueWatching: () => [], loadBoard: async () => [], clockWrong: () => true });
+	const ui = new UiModel(services); await settle();
+	assert.match(ui.message, /date and time are wrong/);
+});

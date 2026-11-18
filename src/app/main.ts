@@ -22,8 +22,14 @@ import { UiModel, type UiServices } from './ui';
 import { drawOsd, drawSubtitleImage, drawSubtitles, drawUi, hitTest, type HitRect } from './ui-draw';
 import { loadSettings, saveSettings, type Settings } from './settings';
 import { promptKeyboard, type KeyboardLike } from './keyboard';
+import { WatchReporter, resumePoint } from './watch';
+import { fillFromCache, loadBoardCache, saveBoardCache } from './board-cache';
+import { loadTrackPrefs, preferredTrack, saveTrackPrefs } from './track-prefs';
 
-const BUILD = 'stremio-nx build 0.4.0-pgs-20261116';
+/** No real clock reads earlier than this build; an earlier date means the console's clock is wrong. */
+const BUILD_EPOCH = Date.UTC(2026, 10, 1);
+
+const BUILD = 'stremio-nx build 0.6.0-video-modes-20261117';
 
 const CONTROL_PORT = 11470;
 const ADDON_PORT = 11471;
@@ -171,8 +177,9 @@ function startPresenting(state: AppState): void {
 			input.poll(now);
 			for (const b of BUTTONS) {
 				if (!input.pressed(b)) continue;
-				if (b === 'minus') state.showStats = !state.showStats;
-				else if (b === 'x' && ui.screen === 'player') setDiag((state.diag + 1) % 4);
+				// Developer overlays only with diagnostics on: a stray press must not blank the video.
+				if (b === 'minus' && diagnosticsLogging) state.showStats = !state.showStats;
+				else if (b === 'x' && ui.screen === 'player' && diagnosticsLogging) setDiag((state.diag + 1) % 4);
 				else ui.press(b);
 			}
 			ui.tick(now);
@@ -290,9 +297,23 @@ async function main(): Promise<void> {
 	let currentHash: string | undefined;
 	let currentHttp: HttpStream | undefined;
 	let pendingStart: { resolve: () => void; reject: (e: Error) => void } | undefined;
+	let watch: WatchReporter | undefined;
+	let trackPrefs = loadTrackPrefs(storage);
+	/** The user picked a track in this video: stop applying remembered languages. */
+	let tracksChosen = false;
+	const applyTrackPrefs = () => {
+		const player = state.player;
+		if (!player || tracksChosen) return;
+		for (const kind of ['audio', 'subtitles'] as const) {
+			const track = preferredTrack(player.tracks(kind), trackPrefs[kind]);
+			if (track) player.selectTrack(kind, track.id).catch((err) => log(`remembered ${kind} track: ${err instanceof Error ? err.message : String(err)}`));
+		}
+	};
 	const stop = () => {
 		pendingStart?.reject(new Error('cancelled'));
 		pendingStart = undefined;
+		watch?.stop(); // stores the resume point while the player can still say where it is
+		watch = undefined;
 		state.player?.stop();
 		state.player = undefined;
 		currentHttp?.close();
@@ -312,7 +333,14 @@ async function main(): Promise<void> {
 			return `Open ${setupOrigin()} on your phone. Code ${pairingCode}. Connect, then open the selected service link.`;
 		},
 		tracks: kind => state.player?.tracks(kind) ?? [],
-		selectTrack: async (kind, id) => { if (state.player) await state.player.selectTrack(kind, id); },
+		selectTrack: async (kind, id) => {
+			if (!state.player) return;
+			await state.player.selectTrack(kind, id);
+			// Remember the language for the next video.
+			tracksChosen = true;
+			const language = id === 'off' ? 'off' : state.player.tracks(kind).find((t) => t.id === id)?.language;
+			if (language) { trackPrefs = { ...trackPrefs, [kind]: language }; saveTrackPrefs(storage, trackPrefs); }
+		},
 		subtitleDelay: delta => {
 			if (!state.player) return 0;
 			if (delta !== undefined) state.player.subtitleDelay = Math.max(-60, Math.min(60, state.player.subtitleDelay + delta));
@@ -320,7 +348,14 @@ async function main(): Promise<void> {
 		},
 		trackNotice: () => state.player?.trackNotice() ?? '',
 		catalogs: () => core.catalogs(),
-		loadBoard: (onUpdate) => core.loadBoard(8, onUpdate),
+		loadBoard: async (onUpdate) => {
+			// Last launch's rows fill in at once; fresh results replace them as add-ons answer.
+			const cache = loadBoardCache(storage);
+			const rows = await core.loadBoard(8, (partial) => onUpdate?.(fillFromCache(partial, cache)));
+			if (rows.length > 0) saveBoardCache(storage, rows);
+			return rows;
+		},
+		clockWrong: () => Date.now() < BUILD_EPOCH,
 		continueWatching: () => core.continueWatching(),
 		loadCatalog: (c) => core.loadCatalog(c.addonUrl, c.type, c.id),
 		loadLibrary: () => core.loadLibrary(),
@@ -334,6 +369,7 @@ async function main(): Promise<void> {
 			diagnosticsLogging = next.diagnostics;
 			saveSettings(storage, next);
 			if (diagnosticsChanged) log(`diagnostics logging ${next.diagnostics ? 'on' : 'off'}`);
+			if (!next.diagnostics) { state.showStats = false; if (state.diag !== 0) setDiag(0); }
 		},
 		play: async (option, meta, videoId, onProgress) => {
 			// One promise that only ever rejects (cancel from B, or the timeout);
@@ -354,7 +390,7 @@ async function main(): Promise<void> {
 			}, 1000);
 			try {
 				onProgress('Asking the core for the stream…');
-				const selected = await Promise.race([core.loadPlayer(option, meta, videoId), failure]);
+				const { stream: selected } = await Promise.race([core.loadPlayer(option, meta, videoId), failure]);
 				let input: HttpStream | ReturnType<typeof sessions.getOrCreate>['engine'];
 				let file: { length: number; path: string[] };
 				if (streamKind(selected) === 'url') {
@@ -376,10 +412,12 @@ async function main(): Promise<void> {
 				state.player = new MediaPlayer(input, file, {
 					log,
 					diagnostics: () => diagnosticsLogging,
+					videoMode: () => settings.videoMode,
 					subtitles: { addons: core.addons(), type: meta.type, videoId },
-					onChanged: () => state.ui?.invalidate(),
+					// Add-on subtitles arrive after playback starts: the remembered language may be among them.
+					onChanged: () => { state.ui?.invalidate(); if (!pendingStart) applyTrackPrefs(); },
 					onStarted: () => { consoleHidden = true; pendingStart?.resolve(); pendingStart = undefined; },
-					onEnded: () => state.ui?.stopPlayback(),
+					onEnded: () => { watch?.ended(); watch = undefined; state.ui?.playbackEnded(); },
 					onError: error => {
 						if (pendingStart) fail(error);
 						else { state.ui?.stopPlayback(); if (state.ui) { state.ui.message = error.message; state.ui.invalidate(); } }
@@ -387,6 +425,14 @@ async function main(): Promise<void> {
 				});
 				state.player.start();
 				await Promise.race([began, failure]);
+				// Resume where the user stopped (the library entry may load after the stream did).
+				const started = state.player;
+				tracksChosen = false;
+				applyTrackPrefs();
+				const resumeAt = resumePoint(core.playerProgress(videoId).resumeMs, started.playback().duration);
+				if (resumeAt > 0) { log(`resume at ${resumeAt}s`); started.seekTo(resumeAt); }
+				watch = new WatchReporter(core, () => (state.player === started ? started.playback() : null));
+				return { resumedAt: resumeAt || undefined };
 			} catch (err) {
 				stop();
 				throw err;
